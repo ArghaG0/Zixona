@@ -10,10 +10,17 @@ load_dotenv()
 
 # --- Configuration ---
 TOKEN = os.environ.get("BOT_TOKEN")
+# NEW: Load FFMPEG_PATH from environment variables
+FFMPEG_PATH = os.environ.get("FFMPEG_PATH")
 
 if not TOKEN:
     print("Error: BOT_TOKEN environment variable not set. Please set it in your hosting environment.")
     exit(1)
+
+if not FFMPEG_PATH:
+    print("Warning: FFMPEG_PATH environment variable not set. FFmpeg may not be found. Please set it in your .env or hosting environment.")
+    # We won't exit here, as it might still work if ffmpeg is in system PATH,
+    # but it's better to explicitly set it.
 
 # Define bot intents
 intents = discord.Intents.default()
@@ -24,6 +31,9 @@ intents.voice_states = True # CRITICAL for music bot
 # Initialize the bot
 # Prefix is "zix " (with a space)
 bot = commands.Bot(command_prefix='zix ', intents=intents)
+
+# Store FFMPEG_PATH on the bot object so cogs can access it
+bot.ffmpeg_path = FFMPEG_PATH
 
 # --- Cog Loading Function ---
 async def load_extensions():
@@ -70,8 +80,6 @@ async def on_ready():
     print('All cogs loaded!')
 
     # Sync slash commands (if you add them later)
-    # This is good practice if you plan to use slash commands.
-    # It sends your bot's slash command definitions to Discord.
     try:
         await bot.tree.sync()
         print("Slash commands synced globally!")
@@ -82,7 +90,6 @@ async def on_ready():
 async def on_command_error(ctx, error):
     """Global error handler for commands."""
     if isinstance(error, commands.CommandNotFound):
-        # Ignore CommandNotFound errors for now, as we don't have commands yet
         pass
     else:
         print(f"An unhandled error occurred: {error}")

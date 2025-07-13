@@ -13,24 +13,38 @@ class Leave(commands.Cog):
 
     @commands.command(name='leave', help='Makes the bot leave the voice channel.')
     async def leave(self, ctx):
-        # Get the MusicPlayer instance
         player = self.bot.get_cog('MusicPlayer')
         if not player:
-            return await ctx.send("Music player core not loaded. Please contact bot owner.")
+            error_embed = discord.Embed(
+                title="Error",
+                description="Music player core not loaded. Please contact bot owner.",
+                color=discord.Color.red()
+            )
+            return await ctx.send(embed=error_embed)
 
         if ctx.voice_client:
             if player.music_task:
-                player.music_task.cancel() # Cancel the music playing task
+                player.music_task.cancel()
                 player.music_task = None
-            player.queue.clear() # Clear the deque
+            player.queue.clear()
             player.is_playing = False
             player.current_song = None
-            ctx.voice_client.stop() # Stop current playback
+            ctx.voice_client.stop()
             await ctx.voice_client.disconnect()
-            player.voice_client = None # Reset voice client reference in player
-            await ctx.send("Disconnected from voice channel and queue cleared.")
+            player.voice_client = None
+            embed = discord.Embed(
+                title="👋 Disconnected",
+                description="Disconnected from voice channel and queue cleared.",
+                color=discord.Color.from_rgb(112, 161, 255)
+            )
+            await ctx.send(embed=embed)
         else:
-            await ctx.send("I'm not in a voice channel.")
+            embed = discord.Embed(
+                title="Not Connected",
+                description="I'm not in a voice channel.",
+                color=discord.Color.orange()
+            )
+            await ctx.send(embed=embed)
 
 # --- Setup function for the cog ---
 async def setup(bot):

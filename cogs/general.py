@@ -13,7 +13,12 @@ class General(commands.Cog):
         Responds with the bot's latency to Discord.
         """
         latency_ms = round(self.bot.latency * 1000)
-        await ctx.send(f'Pong! {latency_ms}ms')
+        embed = discord.Embed(
+            title="🏓 Pong!",
+            description=f"Latency: **{latency_ms}ms**",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
 
 # --- Setup function for the cog ---
 async def setup(bot):
