@@ -19,7 +19,7 @@ intents.message_content = True
 intents.voice_states = True
 
 # Initialize the bot with a command prefix and intents.
-bot = commands.Bot(command_prefix='zix', intents=intents, help_command=None)
+bot = commands.Bot(command_prefix='zix ', intents=intents, help_command=None)
 
 @bot.event
 async def on_ready():

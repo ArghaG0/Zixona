@@ -112,13 +112,13 @@ class MusicCog(commands.Cog):
         # Initialize the MusicPlayer instance
         self.player = MusicPlayer(bot)
 
-    @commands.command(name='play', help=f'Plays a song from YouTube (or other platforms). If a song is playing, it adds to queue. Usage: `zixplay <URL or search term>`')
+    @commands.command(name='play', help=f'Plays a song from YouTube (or other platforms). If a song is playing, it adds to queue. Usage: `zix play <URL or search term>`')
     async def play(self, ctx, *, url):
         """
         Plays a song. If a song is already playing, it adds it to the queue.
         Supports YouTube URLs, playlists, or search terms. Automatically joins VC.
         """
-        print(f"DEBUG: 'zixplay' command received with URL/search: {url}")
+        print(f"DEBUG: 'zix play' command received with URL/search: {url}")
         if not ctx.author.voice:
             embed = discord.Embed(
                 title=f"{EMOJI_ERROR} Voice Channel Required",
@@ -155,7 +155,7 @@ class MusicCog(commands.Cog):
 
         await self.player.add_to_queue(ctx, url)
 
-    @commands.command(name='pause', help=f'Pauses the current song. Usage: `zixpause`')
+    @commands.command(name='pause', help=f'Pauses the current song. Usage: `zix pause`')
     async def pause(self, ctx):
         """
         Pauses the currently playing song.
@@ -190,7 +190,7 @@ class MusicCog(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    @commands.command(name='resume', help=f'Resumes the paused song. Usage: `zixresume`')
+    @commands.command(name='resume', help=f'Resumes the paused song. Usage: `zix resume`')
     async def resume(self, ctx):
         """
         Resumes the currently paused song.
@@ -222,7 +222,7 @@ class MusicCog(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    @commands.command(name='skip', help=f'Skips the current song. Usage: `zixskip`')
+    @commands.command(name='skip', help=f'Skips the current song. Usage: `zix skip`')
     async def skip(self, ctx):
         """
         Skips the current song.
@@ -279,7 +279,7 @@ class MusicCog(commands.Cog):
             )
             await ctx.send(embed=embed)
 
-    @commands.command(name='stop', help=f'Stops the current song, clears the queue, and leaves the voice channel. Usage: `zixstop`')
+    @commands.command(name='stop', help=f'Stops the current song, clears the queue, and leaves the voice channel. Usage: `zix stop`')
     async def stop(self, ctx):
         """
         Stops the current song, clears the entire queue, and leaves the voice channel.
@@ -324,7 +324,7 @@ class MusicCog(commands.Cog):
             )
             await ctx.send(embed=embed)
 
-    @commands.command(name='queue', help=f'Shows the current music queue. Usage: `zixqueue`')
+    @commands.command(name='queue', help=f'Shows the current music queue. Usage: `zix queue`')
     async def show_queue(self, ctx):
         """
         Displays the current songs in the queue with pagination.
@@ -351,7 +351,7 @@ class MusicCog(commands.Cog):
         view = QueueView(ctx, self.player, total_pages)
         view.message = await ctx.send(embed=view._generate_embed(), view=view)
 
-    @commands.command(name='help', help=f'Displays all available commands. Usage: `zixhelp`')
+    @commands.command(name='help', help=f'Displays all available commands. Usage: `zix help`')
     async def help_command(self, ctx):
         """
         Displays all available commands and their descriptions.
