@@ -5,6 +5,7 @@ import asyncio
 import os
 import dotenv # Import the dotenv library
 import collections # Import collections for deque
+import datetime # For formatting song duration
 
 # --- Configuration ---
 # Load environment variables from a .env file
@@ -36,6 +37,25 @@ EMOJI_FETCHING = "🔎"
 EMOJI_QUEUE = "📜"
 EMOJI_VOTE = "🗳️"
 EMOJI_HELP = "❓" # New emoji for help command
+EMOJI_PLAYLIST = "📋" # New emoji for playlists
+
+# --- Helper Function for Duration Formatting ---
+def format_duration(seconds):
+    """Formats duration in seconds to HH:MM:SS or MM:SS."""
+    if seconds is None:
+        return "N/A"
+    
+    # Use timedelta for robust formatting
+    td = datetime.timedelta(seconds=int(seconds))
+    
+    # Extract hours, minutes, seconds
+    hours, remainder = divmod(td.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours > 0:
+        return f"{hours:02}:{minutes:02}:{seconds:02}"
+    else:
+        return f"{minutes:02}:{seconds:02}"
 
 # --- Bot Setup ---
 # Define intents for your bot.
@@ -46,9 +66,7 @@ intents.message_content = True
 intents.voice_states = True
 
 # Initialize the bot with a command prefix and intents.
-# --- FIX: Disable the default help command to allow custom one ---
 bot = commands.Bot(command_prefix='zix ', intents=intents, help_command=None)
-# --- END FIX ---
 
 # --- Audio Player Class ---
 # This class will manage the music queue and playback.
@@ -66,14 +84,13 @@ class MusicPlayer:
         self.skip_required = 0 # Number of votes required to skip
 
         # YTDL options for downloading audio
-        # We'll use 'url' for the direct stream and 'webpage_url' for re-fetching.
         self.YTDL_OPTIONS = {
             'format': 'bestaudio/best',
             'extractaudio': True,
             'audioformat': 'mp3',
             'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
             'restrictfilenames': True,
-            'noplaylist': True,
+            'noplaylist': True, # Set to False when processing a playlist explicitly
             'nocheckcertificate': True,
             'ignoreerrors': False,
             'logtostderr': False,
@@ -84,9 +101,13 @@ class MusicPlayer:
         }
 
         # FFmpeg options for playing audio
+        # --- FIX: Added reconnection options for FFmpeg ---
         self.FFMPEG_OPTIONS = {
-            'options': '-vn' # No video
+            'options': '-vn',
+            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5' # Crucial for stream stability
         }
+        # --- END FIX ---
+
         if FFMPEG_PATH:
             # Normalize path to handle different OS path separators
             normalized_ffmpeg_path = os.path.normpath(FFMPEG_PATH)
@@ -94,30 +115,25 @@ class MusicPlayer:
             # Check if the provided path is a directory
             if os.path.isdir(normalized_ffmpeg_path):
                 # If it's a directory, assume ffmpeg.exe (for Windows) or ffmpeg (for Linux/macOS) is inside it
-                # For robustness, we'll try to append the executable name
                 ffmpeg_executable_name = 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg' # Check OS for executable name
                 ffmpeg_executable_path = os.path.join(normalized_ffmpeg_path, ffmpeg_executable_name)
                 
                 if not os.path.exists(ffmpeg_executable_path):
                     print(f"Warning: FFmpeg executable '{ffmpeg_executable_name}' not found in '{normalized_ffmpeg_path}'.")
                     print("Please ensure FFMPEG_PATH in your .env file points directly to ffmpeg.exe or its containing directory.")
-                    self.FFMPEG_OPTIONS['executable'] = None # Disable ffmpeg if not found
+                    self.FFMPEG_OPTIONS['executable'] = None
                 else:
                     self.FFMPEG_OPTIONS['executable'] = ffmpeg_executable_path
                     print(f"FFmpeg executable path adjusted to: {self.FFMPEG_OPTIONS['executable']}")
             else:
-                # If it's not a directory, assume it's already the full path to the executable
                 self.FFMPEG_OPTIONS['executable'] = normalized_ffmpeg_path
             
-            # Final check to ensure the executable exists at the determined path
             if self.FFMPEG_OPTIONS.get('executable') and not os.path.exists(self.FFMPEG_OPTIONS['executable']):
                 print(f"Warning: FFmpeg executable not found at '{self.FFMPEG_OPTIONS['executable']}'.")
                 print("Please ensure FFMPEG_PATH in your .env file points directly to ffmpeg.exe or its containing directory.")
-                self.FFMPEG_OPTIONS['executable'] = None # Disable ffmpeg if not found
+                self.FFMPEG_OPTIONS['executable'] = None
         else:
             print("FFMPEG_PATH not set in .env. Assuming ffmpeg is in system PATH.")
-            # If FFMPEG_PATH is not set, discord.py will look for 'ffmpeg' in system PATH.
-            # No need to set 'executable' explicitly if it's expected to be in PATH.
 
 
         self.yt_dlp = youtube_dl.YoutubeDL(self.YTDL_OPTIONS)
@@ -133,13 +149,12 @@ class MusicPlayer:
         while not self.bot.is_closed():
             # Wait for current song to finish or be explicitly stopped/skipped
             while self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused()):
-                await asyncio.sleep(1) # Wait for 1 second intervals if a song is playing or paused
+                await asyncio.sleep(1)
 
-            self.current_song = None # Clear current song before fetching new one
-            self.is_playing = False # Ensure this is False before attempting to get a new song
+            self.current_song = None
+            self.is_playing = False
 
             try:
-                # This will block until a song is available in the queue
                 song = await self.queue.get()
                 # Remove song from display queue as it starts playing
                 if self.song_queue_list and self.song_queue_list[0]['webpage_url'] == song['webpage_url']:
@@ -151,11 +166,10 @@ class MusicPlayer:
                 continue
 
             self.current_song = song
-            self.skip_votes = {} # Reset skip votes for the new song
+            self.skip_votes = {}
 
             if self.voice_client and self.voice_client.is_connected():
                 try:
-                    # Ensure FFmpeg executable is set before playing
                     if self.FFMPEG_OPTIONS.get('executable') is None and FFMPEG_PATH is not None:
                         print("FFmpeg executable path is invalid. Cannot play audio.")
                         embed = discord.Embed(
@@ -167,20 +181,19 @@ class MusicPlayer:
                         self.play_next_song(None)
                         continue
                     
-                    # Robustly stop current playback for a clean transition
                     if self.voice_client.is_playing() or self.voice_client.is_paused():
                         self.voice_client.stop()
                         while self.voice_client.is_playing() or self.voice_client.is_paused():
                             await asyncio.sleep(0.1)
                         await asyncio.sleep(0.2)
 
-                    # Re-extract the direct stream URL for fresh playback
                     await self.current_song['channel'].send(embed=discord.Embed(
                         title=f"{EMOJI_FETCHING} Fetching Song...",
                         description=f"Getting ready to play **[{song['title']}]({song['webpage_url']})**...",
                         color=EMBED_COLOR
                     ))
                     
+                    # Re-extract the direct stream URL for fresh playback
                     fresh_data = await self.bot.loop.run_in_executor(
                         None, lambda: self.yt_dlp.extract_info(song['webpage_url'], download=False)
                     )
@@ -191,12 +204,13 @@ class MusicPlayer:
 
                     source = discord.FFmpegPCMAudio(fresh_audio_url, **self.FFMPEG_OPTIONS)
                     self.voice_client.play(source, after=lambda e: self.bot.loop.call_soon_threadsafe(self.play_next_song, e))
-                    self.is_playing = True # Set flag to True when playback starts
+                    self.is_playing = True
                     print(f"Now playing: {song['title']}")
                     
+                    duration_str = format_duration(song.get('duration'))
                     embed = discord.Embed(
                         title=f"{EMOJI_PLAYING} Now Playing",
-                        description=f"**[{song['title']}]({song['webpage_url']})** (Requested by {song['requester'].mention})",
+                        description=f"**[{song['title']}]({song['webpage_url']})**\nDuration: `{duration_str}` (Requested by {song['requester'].mention})",
                         color=EMBED_COLOR
                     )
                     await song['channel'].send(embed=embed)
@@ -220,63 +234,81 @@ class MusicPlayer:
         """
         if error:
             print(f"Player error in play_next_song: {error}")
-        self.is_playing = False # Set flag to False when song finishes
+        self.is_playing = False
         print(f"Song finished or errored, is_playing set to False.")
         self.bot.loop.call_soon_threadsafe(self.queue.task_done)
 
     async def add_to_queue(self, ctx, url):
         """
-        Adds a song to the queue.
-        This function always adds the song to the queue and does NOT interrupt current playback.
+        Adds a song or playlist to the queue.
+        This function always adds the song(s) to the queue and does NOT interrupt current playback.
         """
         try:
-            initial_data = await self.bot.loop.run_in_executor(None, lambda: self.yt_dlp.extract_info(url, download=False))
+            # Set noplaylist to False to allow playlist extraction
+            ytdl_options_with_playlist = self.YTDL_OPTIONS.copy()
+            ytdl_options_with_playlist['noplaylist'] = False
 
-            if 'entries' in initial_data:
-                song_meta = initial_data['entries'][0]
-            else:
-                song_meta = initial_data
+            # Create a new YoutubeDL instance for this specific call to allow playlist extraction
+            yt_dlp_playlist_enabled = youtube_dl.YoutubeDL(ytdl_options_with_playlist)
 
-            song_info = {
-                'title': song_meta.get('title', 'Unknown Title'),
-                'webpage_url': song_meta.get('webpage_url'),
-                'channel': ctx.channel,
-                'requester': ctx.author
-            }
+            # Use run_in_executor to prevent blocking the event loop
+            data = await self.bot.loop.run_in_executor(None, lambda: yt_dlp_playlist_enabled.extract_info(url, download=False))
 
-            if not song_info['webpage_url']:
+            songs_to_add = []
+            if 'entries' in data: # It's a playlist or search result with multiple entries
+                playlist_title = data.get('title', 'Unknown Playlist')
+                for entry in data['entries']:
+                    if entry: # Ensure entry is not None (can happen with private/deleted videos in playlists)
+                        songs_to_add.append({
+                            'title': entry.get('title', 'Unknown Title'),
+                            'webpage_url': entry.get('webpage_url'),
+                            'duration': entry.get('duration'), # Store duration
+                            'channel': ctx.channel,
+                            'requester': ctx.author
+                        })
                 embed = discord.Embed(
-                    title=f"{EMOJI_ERROR} Error",
-                    description=f"Could not find a valid URL for `{url}`.",
+                    title=f"{EMOJI_PLAYLIST} Playlist Added!",
+                    description=f"Added **{len(songs_to_add)}** songs from playlist **[{playlist_title}]({url})** to the queue.",
                     color=EMBED_COLOR
                 )
                 await ctx.send(embed=embed)
-                return
+            else: # Single song
+                songs_to_add.append({
+                    'title': data.get('title', 'Unknown Title'),
+                    'webpage_url': data.get('webpage_url'),
+                    'duration': data.get('duration'), # Store duration
+                    'channel': ctx.channel,
+                    'requester': ctx.author
+                })
+                # Determine if a song is currently being played/paused OR if there are already songs waiting in the queue.
+                is_currently_active_or_has_queue = (self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused())) or not self.queue.empty()
 
-            # Determine if a song is currently being played/paused OR if there are already songs waiting in the queue.
-            is_currently_active_or_has_queue = (self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused())) or not self.queue.empty()
+                if is_currently_active_or_has_queue:
+                    embed = discord.Embed(
+                        title=f"{EMOJI_ADDED} Added to Queue!",
+                        description=f"**[{songs_to_add[0]['title']}]({songs_to_add[0]['webpage_url']})** has been added to the queue.",
+                        color=EMBED_COLOR
+                    )
+                else:
+                    embed = discord.Embed(
+                        title=f"{EMOJI_PLAYING} Starting Playback!",
+                        description=f"**[{songs_to_add[0]['title']}]({songs_to_add[0]['webpage_url']})** will start playing shortly.",
+                        color=EMBED_COLOR
+                    )
+                await ctx.send(embed=embed)
 
-            await self.queue.put(song_info) # Add to asyncio.Queue for playback loop
-            self.song_queue_list.append(song_info) # Add to deque for display
-
-            if is_currently_active_or_has_queue:
-                embed = discord.Embed(
-                    title=f"{EMOJI_ADDED} Added to Queue!",
-                    description=f"**[{song_info['title']}]({song_info['webpage_url']})** has been added to the queue.",
-                    color=EMBED_COLOR
-                )
-            else:
-                embed = discord.Embed(
-                    title=f"{EMOJI_PLAYING} Starting Playback!",
-                    description=f"**[{song_info['title']}]({song_info['webpage_url']})** will start playing shortly.",
-                    color=EMBED_COLOR
-                )
-            await ctx.send(embed=embed)
+            # Add all collected songs to both queues
+            for song_info in songs_to_add:
+                if song_info['webpage_url']: # Ensure URL is valid before adding
+                    await self.queue.put(song_info)
+                    self.song_queue_list.append(song_info)
+                else:
+                    print(f"Skipping invalid song entry: {song_info.get('title', 'Unknown Title')}")
 
         except youtube_dl.DownloadError as e:
             embed = discord.Embed(
                 title=f"{EMOJI_ERROR} Download Error",
-                description=f"Could not download/extract info for `{url}`: `{e}`",
+                description=f"Could not download/extract info for `{url}`: `{e}`. This might be a private video or unsupported link.",
                 color=EMBED_COLOR
             )
             await ctx.send(embed=embed)
@@ -339,14 +371,14 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         embed = discord.Embed(
             title=f"{EMOJI_ERROR} Command Not Found",
-            description="Sorry, that command doesn't exist. Use `!help` to see available commands.",
+            description=f"Sorry, that command doesn't exist. Use `{bot.command_prefix}help` to see available commands.",
             color=EMBED_COLOR
         )
         await ctx.send(embed=embed)
     elif isinstance(error, commands.MissingRequiredArgument):
         embed = discord.Embed(
             title=f"{EMOJI_ERROR} Missing Argument",
-            description=f"Missing arguments. Please provide all required information. Usage: `{ctx.command.usage}`",
+            description=f"Missing arguments. Please provide all required information. Usage: `{bot.command_prefix}{ctx.command.name} {ctx.command.usage or ''}`",
             color=EMBED_COLOR
         )
         await ctx.send(embed=embed)
@@ -392,14 +424,11 @@ async def on_command_error(ctx, error):
 
 # --- Bot Commands ---
 
-# Removed !join command as requested. Bot will join automatically with !play.
-# Removed !leave command as requested. Bot will leave with !stop.
-
-@bot.command(name='play', help='Plays a song from YouTube. If a song is playing, it adds to queue. Usage: !play <URL or search term>')
+@bot.command(name='play', help=f'Plays a song from YouTube (or other platforms). If a song is playing, it adds to queue. Usage: `{bot.command_prefix}play <URL or search term>`')
 async def play(ctx, *, url):
     """
     Plays a song. If a song is already playing, it adds it to the queue.
-    Supports YouTube URLs or search terms. Automatically joins VC.
+    Supports YouTube URLs, playlists, or search terms. Automatically joins VC.
     """
     if not ctx.author.voice:
         embed = discord.Embed(
@@ -409,7 +438,6 @@ async def play(ctx, *, url):
         )
         return await ctx.send(embed=embed)
 
-    # Automatically join the user's voice channel if not already in one or in the wrong one
     channel = ctx.author.voice.channel
     if bot.music_player.voice_client is None or bot.music_player.voice_client.channel != channel:
         try:
@@ -428,7 +456,6 @@ async def play(ctx, *, url):
             )
             return await ctx.send(embed=embed)
 
-    # If for some reason voice client is still not connected after attempting to join
     if not bot.music_player.voice_client:
         embed = discord.Embed(
             title=f"{EMOJI_ERROR} Connection Error",
@@ -439,7 +466,7 @@ async def play(ctx, *, url):
 
     await bot.music_player.add_to_queue(ctx, url)
 
-@bot.command(name='pause', help='Pauses the current song.')
+@bot.command(name='pause', help=f'Pauses the current song. Usage: `{bot.command_prefix}pause`')
 async def pause(ctx):
     """
     Pauses the currently playing song.
@@ -469,7 +496,7 @@ async def pause(ctx):
     )
     await ctx.send(embed=embed)
 
-@bot.command(name='resume', help='Resumes the paused song.')
+@bot.command(name='resume', help=f'Resumes the paused song. Usage: `{bot.command_prefix}resume`')
 async def resume(ctx):
     """
     Resumes the currently paused song.
@@ -491,7 +518,7 @@ async def resume(ctx):
     )
     await ctx.send(embed=embed)
 
-@bot.command(name='skip', help='Skips the current song.')
+@bot.command(name='skip', help=f'Skips the current song. Usage: `{bot.command_prefix}skip`')
 async def skip(ctx):
     """
     Skips the current song.
@@ -548,7 +575,7 @@ async def skip(ctx):
         )
         await ctx.send(embed=embed)
 
-@bot.command(name='stop', help='Stops the current song, clears the queue, and leaves the voice channel.')
+@bot.command(name='stop', help=f'Stops the current song, clears the queue, and leaves the voice channel. Usage: `{bot.command_prefix}stop`')
 async def stop(ctx):
     """
     Stops the current song, clears the entire queue, and leaves the voice channel.
@@ -596,7 +623,7 @@ async def stop(ctx):
         await ctx.send(embed=embed)
 
 
-@bot.command(name='queue', help='Shows the current music queue.')
+@bot.command(name='queue', help=f'Shows the current music queue. Usage: `{bot.command_prefix}queue`')
 async def show_queue(ctx):
     """
     Displays the current songs in the queue.
@@ -604,7 +631,8 @@ async def show_queue(ctx):
     queue_display = []
 
     if bot.music_player.current_song:
-        queue_display.append(f"**Now Playing:** [{bot.music_player.current_song['title']}]({bot.music_player.current_song['webpage_url']}) (Requested by {bot.music_player.current_song['requester'].mention})")
+        duration_str = format_duration(bot.music_player.current_song.get('duration'))
+        queue_display.append(f"**Now Playing:** [{bot.music_player.current_song['title']}]({bot.music_player.current_song['webpage_url']}) (`{duration_str}`) (Requested by {bot.music_player.current_song['requester'].mention})")
 
     if bot.music_player.song_queue_list:
         queue_display.append("\n**Up Next:**")
@@ -612,7 +640,8 @@ async def show_queue(ctx):
             if i >= 10:
                 queue_display.append(f"...and {len(bot.music_player.song_queue_list) - i} more!")
                 break
-            queue_display.append(f"{i+1}. [{song['title']}]({song['webpage_url']}) (Requested by {song['requester'].mention})")
+            duration_str = format_duration(song.get('duration'))
+            queue_display.append(f"{i+1}. [{song['title']}]({song['webpage_url']}) (`{duration_str}`) (Requested by {song['requester'].mention})")
     
     if not queue_display:
         embed = discord.Embed(
@@ -625,7 +654,7 @@ async def show_queue(ctx):
     embed = discord.Embed(title=f"{EMOJI_QUEUE} Music Queue", description="\n".join(queue_display), color=EMBED_COLOR)
     await ctx.send(embed=embed)
 
-@bot.command(name='help', help='Displays all available commands.')
+@bot.command(name='help', help=f'Displays all available commands. Usage: `{bot.command_prefix}help`')
 async def help_command(ctx):
     """
     Displays all available commands and their descriptions.
@@ -637,10 +666,9 @@ async def help_command(ctx):
     )
 
     for command in bot.commands:
-        # Exclude the default help command if it exists and is not this custom one
-        if command.hidden: # If you want to hide certain commands, set their `hidden` attribute to True
+        if command.hidden:
             continue
-        embed.add_field(name=f"`!{command.name}`", value=command.help or "No description provided.", inline=False)
+        embed.add_field(name=f"`{bot.command_prefix}{command.name}`", value=command.help or "No description provided.", inline=False)
     
     await ctx.send(embed=embed)
 
