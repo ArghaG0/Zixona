@@ -35,6 +35,7 @@ EMOJI_ERROR = "❌"
 EMOJI_FETCHING = "🔎"
 EMOJI_QUEUE = "📜"
 EMOJI_VOTE = "🗳️"
+EMOJI_HELP = "❓" # New emoji for help command
 
 # --- Bot Setup ---
 # Define intents for your bot.
@@ -45,8 +46,9 @@ intents.message_content = True
 intents.voice_states = True
 
 # Initialize the bot with a command prefix and intents.
-# The prefix is what you type before your command (e.g., !play).
-bot = commands.Bot(command_prefix='!', intents=intents)
+# --- FIX: Disable the default help command to allow custom one ---
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+# --- END FIX ---
 
 # --- Audio Player Class ---
 # This class will manage the music queue and playback.
@@ -129,12 +131,9 @@ class MusicPlayer:
         """
         await self.bot.wait_until_ready()
         while not self.bot.is_closed():
-            # --- CRITICAL FIX: Wait for current song to finish or be explicitly stopped/skipped ---
-            # This ensures that new songs added via !play do NOT interrupt the current one.
-            # The loop will only proceed to fetch a new song when the voice_client is truly idle.
+            # Wait for current song to finish or be explicitly stopped/skipped
             while self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused()):
                 await asyncio.sleep(1) # Wait for 1 second intervals if a song is playing or paused
-            # --- END CRITICAL FIX ---
 
             self.current_song = None # Clear current song before fetching new one
             self.is_playing = False # Ensure this is False before attempting to get a new song
@@ -142,14 +141,10 @@ class MusicPlayer:
             try:
                 # This will block until a song is available in the queue
                 song = await self.queue.get()
-                # --- FIX: Remove song from display queue as it starts playing ---
-                # This ensures the display queue only shows truly upcoming songs.
-                # Only pop if the deque is not empty and the song matches (safety check for edge cases)
+                # Remove song from display queue as it starts playing
                 if self.song_queue_list and self.song_queue_list[0]['webpage_url'] == song['webpage_url']:
                     self.song_queue_list.popleft()
-                # --- END FIX ---
             except asyncio.CancelledError:
-                # Task was cancelled, exit loop
                 return
             except Exception as e:
                 print(f"Error getting song from queue: {e}")
@@ -169,25 +164,17 @@ class MusicPlayer:
                             color=EMBED_COLOR
                         )
                         await self.current_song['channel'].send(embed=embed)
-                        self.play_next_song(None) # Move to next song if ffmpeg is not found
+                        self.play_next_song(None)
                         continue
                     
                     # Robustly stop current playback for a clean transition
-                    # This is crucial to prevent "Already playing audio" errors when discord.py
-                    # attempts to play a new source while the previous one is still being managed internally.
-                    # This only happens when the loop is *ready* to play a new song, not when a user requests one.
                     if self.voice_client.is_playing() or self.voice_client.is_paused():
                         self.voice_client.stop()
-                        # Wait until the voice client confirms it's no longer playing
-                        # This is more robust than a fixed sleep
                         while self.voice_client.is_playing() or self.voice_client.is_paused():
-                            await asyncio.sleep(0.1) # Small sleep to avoid busy-waiting
-                        # Add a small, fixed delay after the loop to ensure state fully clears
-                        await asyncio.sleep(0.2) # Increased from 0.1 for more robustness
-                    # --- END Robust Stop ---
+                            await asyncio.sleep(0.1)
+                        await asyncio.sleep(0.2)
 
                     # Re-extract the direct stream URL for fresh playback
-                    # This is crucial to prevent URL expiration issues, especially for songs that have been in queue for a while.
                     await self.current_song['channel'].send(embed=discord.Embed(
                         title=f"{EMOJI_FETCHING} Fetching Song...",
                         description=f"Getting ready to play **[{song['title']}]({song['webpage_url']})**...",
@@ -266,13 +253,9 @@ class MusicPlayer:
                 await ctx.send(embed=embed)
                 return
 
-            # --- FIX: Refined feedback logic ---
             # Determine if a song is currently being played/paused OR if there are already songs waiting in the queue.
-            # This ensures "Added to Queue!" is sent if something is already active or queued.
             is_currently_active_or_has_queue = (self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused())) or not self.queue.empty()
-            # --- END FIX ---
 
-            # Add to both the internal queue for playback and the list for display
             await self.queue.put(song_info) # Add to asyncio.Queue for playback loop
             self.song_queue_list.append(song_info) # Add to deque for display
 
@@ -283,7 +266,6 @@ class MusicPlayer:
                     color=EMBED_COLOR
                 )
             else:
-                # This branch is only taken if the bot was completely idle (no song playing, no songs in queue)
                 embed = discord.Embed(
                     title=f"{EMOJI_PLAYING} Starting Playback!",
                     description=f"**[{song_info['title']}]({song_info['webpage_url']})** will start playing shortly.",
@@ -641,6 +623,25 @@ async def show_queue(ctx):
         return await ctx.send(embed=embed)
 
     embed = discord.Embed(title=f"{EMOJI_QUEUE} Music Queue", description="\n".join(queue_display), color=EMBED_COLOR)
+    await ctx.send(embed=embed)
+
+@bot.command(name='help', help='Displays all available commands.')
+async def help_command(ctx):
+    """
+    Displays all available commands and their descriptions.
+    """
+    embed = discord.Embed(
+        title=f"{EMOJI_HELP} Bot Commands",
+        description="Here are all the commands you can use:",
+        color=EMBED_COLOR
+    )
+
+    for command in bot.commands:
+        # Exclude the default help command if it exists and is not this custom one
+        if command.hidden: # If you want to hide certain commands, set their `hidden` attribute to True
+            continue
+        embed.add_field(name=f"`!{command.name}`", value=command.help or "No description provided.", inline=False)
+    
     await ctx.send(embed=embed)
 
 
