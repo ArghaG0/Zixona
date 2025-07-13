@@ -47,7 +47,7 @@ intents.voice_states = True
 
 # Initialize the bot with a command prefix and intents.
 # --- FIX: Disable the default help command to allow custom one ---
-bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+bot = commands.Bot(command_prefix='zix ', intents=intents, help_command=None)
 # --- END FIX ---
 
 # --- Audio Player Class ---
