@@ -23,6 +23,19 @@ FFMPEG_PATH = os.getenv('FFMPEG_PATH') # Now loading FFMPEG_PATH from .env
 # Custom embed color (FFB6C1 - Light Pink)
 EMBED_COLOR = discord.Color(0xFFB6C1)
 
+# --- Global Emoji Variables ---
+EMOJI_PLAYING = "🎶"
+EMOJI_PAUSED = "⏸️"
+EMOJI_ADDED = "✅"
+EMOJI_SKIPPED = "⏭️"
+EMOJI_STOPPED = "⏹️"
+EMOJI_JOINED = "🔊"
+EMOJI_DISCONNECTED = "🔇"
+EMOJI_ERROR = "❌"
+EMOJI_FETCHING = "🔎"
+EMOJI_QUEUE = "📜"
+EMOJI_VOTE = "🗳️"
+
 # --- Bot Setup ---
 # Define intents for your bot.
 # MESSAGE_CONTENT is required to read messages for commands.
@@ -46,7 +59,7 @@ class MusicPlayer:
         self.song_queue_list = collections.deque() 
         self.current_song = None
         self.voice_client = None
-        self.is_playing = False # Flag to indicate if a song is actively playing
+        self.is_playing = False # Flag to indicate if a song is actively playing (not paused)
         self.skip_votes = {} # To handle skip votes in multi-user scenarios
         self.skip_required = 0 # Number of votes required to skip
 
@@ -116,11 +129,11 @@ class MusicPlayer:
         """
         await self.bot.wait_until_ready()
         while not self.bot.is_closed():
-            # --- CRITICAL FIX: Wait for current song to finish before getting next from queue ---
+            # --- CRITICAL FIX: Wait for current song to finish or be explicitly stopped/skipped ---
             # This ensures that new songs added via !play do NOT interrupt the current one.
-            # The loop will only proceed to fetch a new song when `self.is_playing` is False.
-            while self.is_playing:
-                await asyncio.sleep(1) # Wait for 1 second intervals if a song is playing
+            # The loop will only proceed to fetch a new song when the voice_client is truly idle.
+            while self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused()):
+                await asyncio.sleep(1) # Wait for 1 second intervals if a song is playing or paused
             # --- END CRITICAL FIX ---
 
             self.current_song = None # Clear current song before fetching new one
@@ -151,7 +164,7 @@ class MusicPlayer:
                     if self.FFMPEG_OPTIONS.get('executable') is None and FFMPEG_PATH is not None:
                         print("FFmpeg executable path is invalid. Cannot play audio.")
                         embed = discord.Embed(
-                            title="Error",
+                            title=f"{EMOJI_ERROR} Error",
                             description="FFmpeg executable not found. Please check your FFMPEG_PATH in the .env file.",
                             color=EMBED_COLOR
                         )
@@ -159,7 +172,7 @@ class MusicPlayer:
                         self.play_next_song(None) # Move to next song if ffmpeg is not found
                         continue
                     
-                    # --- Robustly stop current playback for a clean transition ---
+                    # Robustly stop current playback for a clean transition
                     # This is crucial to prevent "Already playing audio" errors when discord.py
                     # attempts to play a new source while the previous one is still being managed internally.
                     # This only happens when the loop is *ready* to play a new song, not when a user requests one.
@@ -176,7 +189,7 @@ class MusicPlayer:
                     # Re-extract the direct stream URL for fresh playback
                     # This is crucial to prevent URL expiration issues, especially for songs that have been in queue for a while.
                     await self.current_song['channel'].send(embed=discord.Embed(
-                        title="Fetching Song...",
+                        title=f"{EMOJI_FETCHING} Fetching Song...",
                         description=f"Getting ready to play **[{song['title']}]({song['webpage_url']})**...",
                         color=EMBED_COLOR
                     ))
@@ -195,7 +208,7 @@ class MusicPlayer:
                     print(f"Now playing: {song['title']}")
                     
                     embed = discord.Embed(
-                        title="Now Playing 🎶",
+                        title=f"{EMOJI_PLAYING} Now Playing",
                         description=f"**[{song['title']}]({song['webpage_url']})** (Requested by {song['requester'].mention})",
                         color=EMBED_COLOR
                     )
@@ -203,16 +216,15 @@ class MusicPlayer:
                 except Exception as e:
                     print(f"Error playing song: {e}")
                     embed = discord.Embed(
-                        title="Playback Error",
+                        title=f"{EMOJI_ERROR} Playback Error",
                         description=f"Error playing **{song['title']}**: `{e}`. Skipping to next song.",
                         color=EMBED_COLOR
                     )
                     await self.current_song['channel'].send(embed=embed)
-                    # If an error occurs, try to play the next song
                     self.play_next_song(e)
             else:
                 print("Voice client not connected, skipping song.")
-                self.play_next_song(None) # Move to the next song if not connected
+                self.play_next_song(None)
 
     def play_next_song(self, error):
         """
@@ -223,8 +235,7 @@ class MusicPlayer:
             print(f"Player error in play_next_song: {error}")
         self.is_playing = False # Set flag to False when song finishes
         print(f"Song finished or errored, is_playing set to False.")
-        self.bot.loop.call_soon_threadsafe(self.queue.task_done) # Mark task as done in asyncio.Queue
-        # The audio_player_loop will automatically fetch the next song from self.queue.
+        self.bot.loop.call_soon_threadsafe(self.queue.task_done)
 
     async def add_to_queue(self, ctx, url):
         """
@@ -232,8 +243,6 @@ class MusicPlayer:
         This function always adds the song to the queue and does NOT interrupt current playback.
         """
         try:
-            # Use run_in_executor to prevent blocking the event loop
-            # We only need webpage_url and title at this stage.
             initial_data = await self.bot.loop.run_in_executor(None, lambda: self.yt_dlp.extract_info(url, download=False))
 
             if 'entries' in initial_data:
@@ -243,14 +252,14 @@ class MusicPlayer:
 
             song_info = {
                 'title': song_meta.get('title', 'Unknown Title'),
-                'webpage_url': song_meta.get('webpage_url'), # Store the original URL for re-fetching
-                'channel': ctx.channel, # Store the channel to send messages
-                'requester': ctx.author # Store the requester
+                'webpage_url': song_meta.get('webpage_url'),
+                'channel': ctx.channel,
+                'requester': ctx.author
             }
 
             if not song_info['webpage_url']:
                 embed = discord.Embed(
-                    title="Error",
+                    title=f"{EMOJI_ERROR} Error",
                     description=f"Could not find a valid URL for `{url}`.",
                     color=EMBED_COLOR
                 )
@@ -258,26 +267,25 @@ class MusicPlayer:
                 return
 
             # --- FIX: Refined feedback logic ---
-            # Check if a song is currently playing OR if there are already songs waiting in the queue.
-            # This ensures "Added to Queue!" is sent if something is already playing or queued.
-            # The `is_playing` flag is crucial here.
-            is_currently_playing_or_has_queue = self.is_playing or not self.queue.empty()
+            # Determine if a song is currently being played/paused OR if there are already songs waiting in the queue.
+            # This ensures "Added to Queue!" is sent if something is already active or queued.
+            is_currently_active_or_has_queue = (self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused())) or not self.queue.empty()
             # --- END FIX ---
 
             # Add to both the internal queue for playback and the list for display
             await self.queue.put(song_info) # Add to asyncio.Queue for playback loop
             self.song_queue_list.append(song_info) # Add to deque for display
 
-            if is_currently_playing_or_has_queue:
+            if is_currently_active_or_has_queue:
                 embed = discord.Embed(
-                    title="Added to Queue!",
+                    title=f"{EMOJI_ADDED} Added to Queue!",
                     description=f"**[{song_info['title']}]({song_info['webpage_url']})** has been added to the queue.",
                     color=EMBED_COLOR
                 )
             else:
                 # This branch is only taken if the bot was completely idle (no song playing, no songs in queue)
                 embed = discord.Embed(
-                    title="Starting Playback!",
+                    title=f"{EMOJI_PLAYING} Starting Playback!",
                     description=f"**[{song_info['title']}]({song_info['webpage_url']})** will start playing shortly.",
                     color=EMBED_COLOR
                 )
@@ -285,14 +293,14 @@ class MusicPlayer:
 
         except youtube_dl.DownloadError as e:
             embed = discord.Embed(
-                title="Download Error",
+                title=f"{EMOJI_ERROR} Download Error",
                 description=f"Could not download/extract info for `{url}`: `{e}`",
                 color=EMBED_COLOR
             )
             await ctx.send(embed=embed)
         except Exception as e:
             embed = discord.Embed(
-                title="Error",
+                title=f"{EMOJI_ERROR} Error",
                 description=f"An error occurred while processing your request: `{e}`",
                 color=EMBED_COLOR
             )
@@ -307,7 +315,7 @@ class MusicPlayer:
             if self.voice_client.channel != channel:
                 await self.voice_client.move_to(channel)
                 return True
-            return False # Already in the channel
+            return False
         else:
             self.voice_client = await channel.connect()
             return True
@@ -326,7 +334,7 @@ class MusicPlayer:
                     self.queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-            self.song_queue_list.clear() # Clear the display queue
+            self.song_queue_list.clear()
             self.current_song = None
             return True
         return False
@@ -339,7 +347,6 @@ async def on_ready():
     """
     print(f'Logged in as {bot.user.name} ({bot.user.id})')
     print('------')
-    # Initialize the music player when the bot is ready
     bot.music_player = MusicPlayer(bot)
 
 @bot.event
@@ -349,45 +356,44 @@ async def on_command_error(ctx, error):
     """
     if isinstance(error, commands.CommandNotFound):
         embed = discord.Embed(
-            title="Command Not Found",
+            title=f"{EMOJI_ERROR} Command Not Found",
             description="Sorry, that command doesn't exist. Use `!help` to see available commands.",
             color=EMBED_COLOR
         )
         await ctx.send(embed=embed)
     elif isinstance(error, commands.MissingRequiredArgument):
         embed = discord.Embed(
-            title="Missing Argument",
+            title=f"{EMOJI_ERROR} Missing Argument",
             description=f"Missing arguments. Please provide all required information. Usage: `{ctx.command.usage}`",
             color=EMBED_COLOR
         )
         await ctx.send(embed=embed)
     elif isinstance(error, commands.NoPrivateMessage):
         embed = discord.Embed(
-            title="Private Message Not Allowed",
+            title=f"{EMOJI_ERROR} Private Message Not Allowed",
             description="This command cannot be used in private messages.",
             color=EMBED_COLOR
         )
         await ctx.send(embed=embed)
     elif isinstance(error, commands.BadArgument):
         embed = discord.Embed(
-            title="Bad Argument",
+            title=f"{EMOJI_ERROR} Bad Argument",
             description="Invalid argument provided. Please check your input.",
             color=EMBED_COLOR
         )
         await ctx.send(embed=embed)
     elif isinstance(error, commands.CommandInvokeError):
-        # This catches errors that happen inside the command's code
         original = error.original
         if isinstance(original, discord.Forbidden):
             embed = discord.Embed(
-                title="Permission Denied",
+                title=f"{EMOJI_ERROR} Permission Denied",
                 description="I don't have permission to do that in this channel.",
                 color=EMBED_COLOR
             )
             await ctx.send(embed=embed)
         else:
             embed = discord.Embed(
-                title="Internal Error",
+                title=f"{EMOJI_ERROR} Internal Error",
                 description=f"An internal error occurred: `{original}`",
                 color=EMBED_COLOR
             )
@@ -395,7 +401,7 @@ async def on_command_error(ctx, error):
             print(f"CommandInvokeError: {original}")
     else:
         embed = discord.Embed(
-            title="Unexpected Error",
+            title=f"{EMOJI_ERROR} Unexpected Error",
             description=f"An unexpected error occurred: `{error}`",
             color=EMBED_COLOR
         )
@@ -404,76 +410,46 @@ async def on_command_error(ctx, error):
 
 # --- Bot Commands ---
 
-@bot.command(name='join', help='Makes the bot join your current voice channel.')
-async def join(ctx):
-    """
-    Connects the bot to the voice channel of the command invoker.
-    """
-    if not ctx.author.voice:
-        embed = discord.Embed(
-            title="Voice Channel Required",
-            description="You are not in a voice channel.",
-            color=EMBED_COLOR
-        )
-        return await ctx.send(embed=embed)
+# Removed !join command as requested. Bot will join automatically with !play.
+# Removed !leave command as requested. Bot will leave with !stop.
 
-    channel = ctx.author.voice.channel
-    if await bot.music_player.connect_to_voice(channel):
-        embed = discord.Embed(
-            title="Joined Voice Channel",
-            description=f"Joined voice channel: **{channel.name}**",
-            color=EMBED_COLOR
-        )
-        await ctx.send(embed=embed)
-    else:
-        embed = discord.Embed(
-            title="Already Connected",
-            description=f"I am already in voice channel: **{channel.name}**",
-            color=EMBED_COLOR
-        )
-        await ctx.send(embed=embed)
-
-@bot.command(name='leave', help='Makes the bot leave the voice channel.')
-async def leave(ctx):
-    """
-    Disconnects the bot from the voice channel.
-    """
-    if await bot.music_player.disconnect_from_voice():
-        embed = discord.Embed(
-            title="Disconnected",
-            description="Disconnected from voice channel.",
-            color=EMBED_COLOR
-        )
-        await ctx.send(embed=embed)
-    else:
-        embed = discord.Embed(
-            title="Not Connected",
-            description="I am not currently in a voice channel.",
-            color=EMBED_COLOR
-        )
-        await ctx.send(embed=embed)
-
-@bot.command(name='play', help='Plays a song from YouTube. Usage: !play <URL or search term>')
+@bot.command(name='play', help='Plays a song from YouTube. If a song is playing, it adds to queue. Usage: !play <URL or search term>')
 async def play(ctx, *, url):
     """
     Plays a song. If a song is already playing, it adds it to the queue.
-    Supports YouTube URLs or search terms.
+    Supports YouTube URLs or search terms. Automatically joins VC.
     """
     if not ctx.author.voice:
         embed = discord.Embed(
-            title="Voice Channel Required",
-            description="You need to be in a voice channel to play music.",
+            title=f"{EMOJI_ERROR} Voice Channel Required",
+            description="You are not in a voice channel. Please join one first.",
             color=EMBED_COLOR
         )
         return await ctx.send(embed=embed)
 
-    # Ensure bot is in the same voice channel as the user
-    if bot.music_player.voice_client is None or bot.music_player.voice_client.channel != ctx.author.voice.channel:
-        await join(ctx) # Automatically join if not in channel or wrong channel
+    # Automatically join the user's voice channel if not already in one or in the wrong one
+    channel = ctx.author.voice.channel
+    if bot.music_player.voice_client is None or bot.music_player.voice_client.channel != channel:
+        try:
+            await bot.music_player.connect_to_voice(channel)
+            embed = discord.Embed(
+                title=f"{EMOJI_JOINED} Joined Voice Channel",
+                description=f"Joined voice channel: **{channel.name}**",
+                color=EMBED_COLOR
+            )
+            await ctx.send(embed=embed)
+        except Exception as e:
+            embed = discord.Embed(
+                title=f"{EMOJI_ERROR} Connection Error",
+                description=f"Could not connect to voice channel: `{e}`",
+                color=EMBED_COLOR
+            )
+            return await ctx.send(embed=embed)
 
+    # If for some reason voice client is still not connected after attempting to join
     if not bot.music_player.voice_client:
         embed = discord.Embed(
-            title="Connection Error",
+            title=f"{EMOJI_ERROR} Connection Error",
             description="I could not connect to a voice channel. Please try again.",
             color=EMBED_COLOR
         )
@@ -481,14 +457,66 @@ async def play(ctx, *, url):
 
     await bot.music_player.add_to_queue(ctx, url)
 
+@bot.command(name='pause', help='Pauses the current song.')
+async def pause(ctx):
+    """
+    Pauses the currently playing song.
+    """
+    if not bot.music_player.voice_client or not bot.music_player.voice_client.is_playing():
+        embed = discord.Embed(
+            title=f"{EMOJI_ERROR} Nothing Playing",
+            description="No song is currently playing to pause.",
+            color=EMBED_COLOR
+        )
+        return await ctx.send(embed=embed)
+    
+    if bot.music_player.voice_client.is_paused():
+        embed = discord.Embed(
+            title=f"{EMOJI_PAUSED} Already Paused",
+            description="The song is already paused.",
+            color=EMBED_COLOR
+        )
+        return await ctx.send(embed=embed)
+
+    bot.music_player.voice_client.pause()
+    bot.music_player.is_playing = False # Update state
+    embed = discord.Embed(
+        title=f"{EMOJI_PAUSED} Playback Paused",
+        description="The current song has been paused.",
+        color=EMBED_COLOR
+    )
+    await ctx.send(embed=embed)
+
+@bot.command(name='resume', help='Resumes the paused song.')
+async def resume(ctx):
+    """
+    Resumes the currently paused song.
+    """
+    if not bot.music_player.voice_client or not bot.music_player.voice_client.is_paused():
+        embed = discord.Embed(
+            title=f"{EMOJI_ERROR} Nothing Paused",
+            description="No song is currently paused to resume.",
+            color=EMBED_COLOR
+        )
+        return await ctx.send(embed=embed)
+
+    bot.music_player.voice_client.resume()
+    bot.music_player.is_playing = True # Update state
+    embed = discord.Embed(
+        title=f"{EMOJI_PLAYING} Playback Resumed",
+        description="The song has been resumed.",
+        color=EMBED_COLOR
+    )
+    await ctx.send(embed=embed)
+
 @bot.command(name='skip', help='Skips the current song.')
 async def skip(ctx):
     """
     Skips the current song.
     """
-    if not bot.music_player.is_playing and bot.music_player.queue.empty(): # Check both playing status and queue
+    if not bot.music_player.is_playing and bot.music_player.queue.empty():
         embed = discord.Embed(
-            title="No Song Playing",
+            title=f"{EMOJI_ERROR} No Song Playing",
             description="No song is currently playing or in the queue to skip.",
             color=EMBED_COLOR
         )
@@ -496,66 +524,65 @@ async def skip(ctx):
 
     if not bot.music_player.voice_client:
         embed = discord.Embed(
-            title="Not Connected",
+            title=f"{EMOJI_ERROR} Not Connected",
             description="I am not in a voice channel.",
             color=EMBED_COLOR
         )
         return await ctx.send(embed=embed)
 
-    # Implement a simple voting system for skipping if multiple users are present
     members_in_vc = [m for m in bot.music_player.voice_client.channel.members if not m.bot]
-    if len(members_in_vc) > 1: # If more than one human user
+    if len(members_in_vc) > 1:
         if ctx.author.id not in bot.music_player.skip_votes:
             bot.music_player.skip_votes[ctx.author.id] = True
-            bot.music_player.skip_required = len(members_in_vc) // 2 + 1 # Majority vote
+            bot.music_player.skip_required = len(members_in_vc) // 2 + 1
             current_votes = len(bot.music_player.skip_votes)
             embed = discord.Embed(
-                title="Skip Vote",
+                title=f"{EMOJI_VOTE} Skip Vote",
                 description=f"Skip vote added by {ctx.author.display_name}. {current_votes}/{bot.music_player.skip_required} votes to skip.",
                 color=EMBED_COLOR
             )
             await ctx.send(embed=embed)
             if current_votes >= bot.music_player.skip_required:
-                bot.music_player.voice_client.stop() # This will trigger play_next_song
+                bot.music_player.voice_client.stop()
                 embed = discord.Embed(
-                    title="Song Skipped!",
+                    title=f"{EMOJI_SKIPPED} Song Skipped!",
                     description="The song has been skipped by popular vote.",
                     color=EMBED_COLOR
                 )
                 await ctx.send(embed=embed)
         else:
             embed = discord.Embed(
-                title="Vote Already Cast",
+                title=f"{EMOJI_ERROR} Vote Already Cast",
                 description="You have already voted to skip this song.",
                 color=EMBED_COLOR
             )
             await ctx.send(embed=embed)
-    else: # Only one user or bot is present, no vote needed
-        bot.music_player.voice_client.stop() # This will trigger play_next_song
+    else:
+        bot.music_player.voice_client.stop()
         embed = discord.Embed(
-            title="Song Skipped!",
+            title=f"{EMOJI_SKIPPED} Song Skipped!",
             description="The song has been skipped.",
             color=EMBED_COLOR
         )
         await ctx.send(embed=embed)
 
-@bot.command(name='stop', help='Stops the current song and clears the queue.')
+@bot.command(name='stop', help='Stops the current song, clears the queue, and leaves the voice channel.')
 async def stop(ctx):
     """
-    Stops the current song and clears the entire queue.
+    Stops the current song, clears the entire queue, and leaves the voice channel.
     """
     if not bot.music_player.voice_client:
         embed = discord.Embed(
-            title="Not Playing",
-            description="I am not currently playing anything.",
+            title=f"{EMOJI_ERROR} Not Playing",
+            description="I am not currently playing anything or in a voice channel.",
             color=EMBED_COLOR
         )
         return await ctx.send(embed=embed)
 
-    if bot.music_player.voice_client.is_playing():
+    if bot.music_player.voice_client.is_playing() or bot.music_player.voice_client.is_paused():
         bot.music_player.voice_client.stop()
         embed = discord.Embed(
-            title="Playback Stopped",
+            title=f"{EMOJI_STOPPED} Playback Stopped",
             description="Playback stopped.",
             color=EMBED_COLOR
         )
@@ -567,14 +594,25 @@ async def stop(ctx):
             bot.music_player.queue.get_nowait()
         except asyncio.QueueEmpty:
             break
-    bot.music_player.song_queue_list.clear() # Clear the display queue
+    bot.music_player.song_queue_list.clear()
     bot.music_player.current_song = None
-    embed = discord.Embed(
-        title="Queue Cleared",
-        description="The music queue has been cleared.",
-        color=EMBED_COLOR
-    )
-    await ctx.send(embed=embed)
+    
+    # Disconnect after stopping and clearing queue
+    if await bot.music_player.disconnect_from_voice():
+        embed = discord.Embed(
+            title=f"{EMOJI_STOPPED} Disconnected",
+            description="The music queue has been cleared and I have left the voice channel.",
+            color=EMBED_COLOR
+        )
+        await ctx.send(embed=embed)
+    else:
+        embed = discord.Embed(
+            title=f"{EMOJI_STOPPED} Stopped",
+            description="The music queue has been cleared.",
+            color=EMBED_COLOR
+        )
+        await ctx.send(embed=embed)
+
 
 @bot.command(name='queue', help='Shows the current music queue.')
 async def show_queue(ctx):
@@ -589,21 +627,20 @@ async def show_queue(ctx):
     if bot.music_player.song_queue_list:
         queue_display.append("\n**Up Next:**")
         for i, song in enumerate(bot.music_player.song_queue_list):
-            # Limit the number of songs displayed to prevent overly long embeds
-            if i >= 10: # Display up to 10 upcoming songs
+            if i >= 10:
                 queue_display.append(f"...and {len(bot.music_player.song_queue_list) - i} more!")
                 break
             queue_display.append(f"{i+1}. [{song['title']}]({song['webpage_url']}) (Requested by {song['requester'].mention})")
     
-    if not queue_display: # If both current song and queue are empty
+    if not queue_display:
         embed = discord.Embed(
-            title="Music Queue",
+            title=f"{EMOJI_QUEUE} Music Queue",
             description="The queue is empty.",
             color=EMBED_COLOR
         )
         return await ctx.send(embed=embed)
 
-    embed = discord.Embed(title="Music Queue", description="\n".join(queue_display), color=EMBED_COLOR)
+    embed = discord.Embed(title=f"{EMOJI_QUEUE} Music Queue", description="\n".join(queue_display), color=EMBED_COLOR)
     await ctx.send(embed=embed)
 
 
