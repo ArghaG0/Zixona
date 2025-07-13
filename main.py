@@ -6,6 +6,7 @@ import os
 import dotenv # Import the dotenv library
 import collections # Import collections for deque
 import datetime # For formatting song duration
+import time # For time.time() to track playback progress
 
 # --- Configuration ---
 # Load environment variables from a .env file
@@ -82,6 +83,10 @@ class MusicPlayer:
         self.is_playing = False # Flag to indicate if a song is actively playing (not paused)
         self.skip_votes = {} # To handle skip votes in multi-user scenarios
         self.skip_required = 0 # Number of votes required to skip
+        self.now_playing_message = None # Stores the message to update live duration
+        self.progress_update_task = None # Stores the asyncio task for updating progress
+        self.playback_start_time = 0 # Tracks the time.time() when the current song started playing
+        self.paused_at_time = 0 # Stores the elapsed time when the song was paused
 
         # YTDL options for downloading audio
         self.YTDL_OPTIONS = {
@@ -101,12 +106,10 @@ class MusicPlayer:
         }
 
         # FFmpeg options for playing audio
-        # --- FIX: Added reconnection options for FFmpeg ---
         self.FFMPEG_OPTIONS = {
             'options': '-vn',
             'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5' # Crucial for stream stability
         }
-        # --- END FIX ---
 
         if FFMPEG_PATH:
             # Normalize path to handle different OS path separators
@@ -139,6 +142,93 @@ class MusicPlayer:
         self.yt_dlp = youtube_dl.YoutubeDL(self.YTDL_OPTIONS)
         self.audio_player_task = bot.loop.create_task(self.audio_player_loop())
 
+    async def _update_now_playing_progress(self, song_info, message):
+        """
+        Updates the 'Now Playing' message with live song progress.
+        """
+        total_duration = song_info.get('duration')
+        print(f"DEBUG: _update_now_playing_progress started for {song_info['title']}. Total duration: {total_duration}")
+
+        if total_duration is None or total_duration == 0: # Handle 0 duration as well
+            print(f"DEBUG: Skipping progress update for {song_info['title']} due to missing/zero duration.")
+            return # Cannot track live progress without total duration
+
+        # Loop as long as the current song is the one being tracked and the voice client is connected
+        while self.voice_client and self.current_song == song_info and self.voice_client.is_connected():
+            if self.voice_client.is_playing():
+                elapsed_time = time.time() - self.playback_start_time
+            elif self.voice_client.is_paused():
+                elapsed_time = self.paused_at_time # Keep elapsed time fixed when paused
+            else:
+                print(f"DEBUG: _update_now_playing_progress loop broken for {song_info['title']}. Voice client not playing/paused.")
+                break # If not playing or paused, song has likely finished or stopped
+
+            # Ensure elapsed_time doesn't exceed total_duration
+            if elapsed_time > total_duration:
+                elapsed_time = total_duration
+
+            elapsed_str = format_duration(elapsed_time)
+            total_str = format_duration(total_duration)
+
+            # Create a simple progress bar (e.g., █────)
+            bar_length = 20
+            # Ensure total_duration is not zero before division
+            if total_duration > 0:
+                filled_blocks = int((elapsed_time / total_duration) * bar_length)
+            else:
+                filled_blocks = 0 # If duration is zero, no progress
+            progress_bar = "█" * filled_blocks + "─" * (bar_length - filled_blocks)
+
+            new_description = (
+                f"**[{song_info['title']}]({song_info['webpage_url']})** "
+                f"(Requested by {song_info['requester'].mention})\n"
+                f"`{elapsed_str} {progress_bar} {total_str}`"
+            )
+            print(f"DEBUG: Updating progress for {song_info['title']}: {elapsed_str}/{total_str}")
+
+            try:
+                # Check if the message still exists before attempting to edit
+                fetched_message = await message.channel.fetch_message(message.id)
+                if fetched_message:
+                    # Create a new embed to avoid modifying the original in place if it's reused
+                    updated_embed = discord.Embed(
+                        title=f"{EMOJI_PLAYING} Now Playing",
+                        description=new_description,
+                        color=EMBED_COLOR
+                    )
+                    await message.edit(embed=updated_embed)
+            except discord.NotFound:
+                print("DEBUG: Now Playing message not found, stopping progress updates.")
+                break # Stop the loop if message is deleted
+            except Exception as e:
+                print(f"DEBUG: Error updating live progress message: {e}")
+                break # Stop on other errors
+
+            await asyncio.sleep(5) # Update every 5 seconds
+
+        # Ensure the message is finalized when playback stops/pauses
+        print(f"DEBUG: Finalizing progress update for {song_info['title']}.")
+        if self.current_song == song_info and message:
+            try:
+                # Fetch message again to ensure it exists before final update
+                fetched_message = await message.channel.fetch_message(message.id)
+                if fetched_message:
+                    final_description = (
+                        f"**[{song_info['title']}]({song_info['webpage_url']})**\n"
+                        f"Duration: `{format_duration(total_duration)}` (Requested by {song_info['requester'].mention})"
+                    )
+                    final_embed = discord.Embed(
+                        title=f"{EMOJI_PLAYING} Now Playing (Finished)",
+                        description=final_description,
+                        color=EMBED_COLOR
+                    )
+                    await message.edit(embed=final_embed)
+            except discord.NotFound:
+                pass # Message already deleted, no need to update
+            except Exception as e:
+                print(f"DEBUG: Error finalizing Now Playing message: {e}")
+
+
     async def audio_player_loop(self):
         """
         Main loop for playing songs from the queue.
@@ -147,15 +237,33 @@ class MusicPlayer:
         """
         await self.bot.wait_until_ready()
         while not self.bot.is_closed():
-            # Wait for current song to finish or be explicitly stopped/skipped
-            while self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused()):
-                await asyncio.sleep(1)
+            # CRITICAL FIX: Wait until the voice client is idle AND there is a song in the queue
+            # This ensures we only fetch a new song when the bot is ready to play it, preventing interruptions.
+            while True:
+                if self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused()):
+                    await asyncio.sleep(1) # Wait if a song is active (playing or paused)
+                elif not self.queue.empty():
+                    break # A song is in queue and voice client is idle, proceed to get it
+                else:
+                    await asyncio.sleep(1) # No song in queue and voice client is idle, wait for a song to be added
+
+            # Cancel any existing progress update task before starting a new song
+            if self.progress_update_task and not self.progress_update_task.done():
+                self.progress_update_task.cancel()
+                try:
+                    await self.progress_update_task # Await cancellation
+                except asyncio.CancelledError:
+                    pass
+                self.progress_update_task = None
+                self.now_playing_message = None # Clear the message reference
 
             self.current_song = None
             self.is_playing = False
+            self.playback_start_time = 0 # Reset playback start time
+            self.paused_at_time = 0 # Reset paused time
 
             try:
-                song = await self.queue.get()
+                song = await self.queue.get() # Now this `get()` happens only when ready
                 # Remove song from display queue as it starts playing
                 if self.song_queue_list and self.song_queue_list[0]['webpage_url'] == song['webpage_url']:
                     self.song_queue_list.popleft()
@@ -174,13 +282,14 @@ class MusicPlayer:
                         print("FFmpeg executable path is invalid. Cannot play audio.")
                         embed = discord.Embed(
                             title=f"{EMOJI_ERROR} Error",
-                            description="FFmpeg executable not found. Please check your FFMPEG_PATH in the .env file.",
+                            description="FFMpeg executable not found. Please check your FFMPEG_PATH in the .env file.",
                             color=EMBED_COLOR
                         )
                         await self.current_song['channel'].send(embed=embed)
                         self.play_next_song(None)
                         continue
                     
+                    # Robustly stop current playback for a clean transition (if any was somehow still active)
                     if self.voice_client.is_playing() or self.voice_client.is_paused():
                         self.voice_client.stop()
                         while self.voice_client.is_playing() or self.voice_client.is_paused():
@@ -205,15 +314,26 @@ class MusicPlayer:
                     source = discord.FFmpegPCMAudio(fresh_audio_url, **self.FFMPEG_OPTIONS)
                     self.voice_client.play(source, after=lambda e: self.bot.loop.call_soon_threadsafe(self.play_next_song, e))
                     self.is_playing = True
+                    self.playback_start_time = time.time() # Set the start time when playback begins
                     print(f"Now playing: {song['title']}")
                     
-                    duration_str = format_duration(song.get('duration'))
-                    embed = discord.Embed(
+                    # Store the message and start the progress update task
+                    initial_duration_str = format_duration(song.get('duration'))
+                    initial_embed = discord.Embed(
                         title=f"{EMOJI_PLAYING} Now Playing",
-                        description=f"**[{song['title']}]({song['webpage_url']})**\nDuration: `{duration_str}` (Requested by {song['requester'].mention})",
+                        description=f"**[{song['title']}]({song['webpage_url']})**\nDuration: `{initial_duration_str}` (Requested by {song['requester'].mention})",
                         color=EMBED_COLOR
                     )
-                    await song['channel'].send(embed=embed)
+                    self.now_playing_message = await song['channel'].send(embed=initial_embed)
+                    
+                    if song.get('duration') is not None and song.get('duration') > 0:
+                        print(f"Starting progress update task for {song['title']} (Duration: {song['duration']}).") # Debug print
+                        self.progress_update_task = self.bot.loop.create_task(
+                            self._update_now_playing_progress(song, self.now_playing_message)
+                        )
+                    else:
+                        print(f"Not starting progress update task for {song['title']} due to missing/zero duration.") # Debug print
+
                 except Exception as e:
                     print(f"Error playing song: {e}")
                     embed = discord.Embed(
@@ -237,6 +357,13 @@ class MusicPlayer:
         self.is_playing = False
         print(f"Song finished or errored, is_playing set to False.")
         self.bot.loop.call_soon_threadsafe(self.queue.task_done)
+        # Cancel the progress update task when the song finishes
+        if self.progress_update_task and not self.progress_update_task.done():
+            self.progress_update_task.cancel()
+            self.progress_update_task = None
+            self.now_playing_message = None # Clear the message reference
+        self.playback_start_time = 0 # Reset start time
+        self.paused_at_time = 0 # Reset paused time
 
     async def add_to_queue(self, ctx, url):
         """
@@ -350,6 +477,13 @@ class MusicPlayer:
                     break
             self.song_queue_list.clear()
             self.current_song = None
+            # Cancel progress update task if bot disconnects
+            if self.progress_update_task and not self.progress_update_task.done():
+                self.progress_update_task.cancel()
+                self.progress_update_task = None
+                self.now_playing_message = None
+            self.playback_start_time = 0
+            self.paused_at_time = 0
             return True
         return False
 
@@ -489,6 +623,13 @@ async def pause(ctx):
 
     bot.music_player.voice_client.pause()
     bot.music_player.is_playing = False # Update state
+    # Store the elapsed time when paused
+    if bot.music_player.playback_start_time != 0:
+        bot.music_player.paused_at_time = time.time() - bot.music_player.playback_start_time
+    # Cancel the progress update task when paused
+    if bot.music_player.progress_update_task and not bot.music_player.progress_update_task.done():
+        bot.music_player.progress_update_task.cancel()
+        bot.music_player.progress_update_task = None
     embed = discord.Embed(
         title=f"{EMOJI_PAUSED} Playback Paused",
         description="The current song has been paused.",
@@ -511,6 +652,18 @@ async def resume(ctx):
 
     bot.music_player.voice_client.resume()
     bot.music_player.is_playing = True # Update state
+    # Adjust the playback start time to account for the pause duration
+    bot.music_player.playback_start_time = time.time() - bot.music_player.paused_at_time
+    # Restart the progress update task when resumed
+    if bot.music_player.current_song and bot.music_player.now_playing_message and bot.music_player.progress_update_task is None:
+        if bot.music_player.current_song.get('duration') is not None and bot.music_player.current_song.get('duration') > 0:
+            print(f"DEBUG: Restarting progress update task for {bot.music_player.current_song['title']}.")
+            bot.music_player.progress_update_task = bot.bot.loop.create_task(
+                bot.music_player._update_now_playing_progress(bot.music_player.current_song, bot.music_player.now_playing_message)
+            )
+        else:
+            print(f"DEBUG: Not restarting progress update task for {bot.music_player.current_song['title']} due to missing/zero duration.")
+
     embed = discord.Embed(
         title=f"{EMOJI_PLAYING} Playback Resumed",
         description="The song has been resumed.",
@@ -631,8 +784,29 @@ async def show_queue(ctx):
     queue_display = []
 
     if bot.music_player.current_song:
-        duration_str = format_duration(bot.music_player.current_song.get('duration'))
-        queue_display.append(f"**Now Playing:** [{bot.music_player.current_song['title']}]({bot.music_player.current_song['webpage_url']}) (`{duration_str}`) (Requested by {bot.music_player.current_song['requester'].mention})")
+        # Calculate current elapsed time for the "Now Playing" song in queue display
+        elapsed_time = 0
+        # Only calculate elapsed time if the voice client is active and it's the current song
+        if bot.music_player.voice_client and bot.music_player.current_song:
+            if bot.music_player.voice_client.is_playing():
+                elapsed_time = time.time() - bot.music_player.playback_start_time
+            elif bot.music_player.voice_client.is_paused():
+                elapsed_time = bot.music_player.paused_at_time
+        
+        total_duration = bot.music_player.current_song.get('duration')
+        duration_str = format_duration(total_duration)
+        elapsed_str = format_duration(elapsed_time)
+        
+        # Add a simple progress indicator for the current song in the queue display
+        if total_duration and total_duration > 0:
+            bar_length = 10 # Shorter bar for queue display
+            # Ensure elapsed_time does not exceed total_duration for progress bar calculation
+            current_elapsed_for_bar = min(elapsed_time, total_duration)
+            filled_blocks = int((current_elapsed_for_bar / total_duration) * bar_length)
+            progress_bar = "█" * filled_blocks + "─" * (bar_length - filled_blocks)
+            queue_display.append(f"**Now Playing:** [{bot.music_player.current_song['title']}]({bot.music_player.current_song['webpage_url']})\n`{elapsed_str} {progress_bar} {duration_str}` (Requested by {bot.music_player.current_song['requester'].mention})")
+        else:
+            queue_display.append(f"**Now Playing:** [{bot.music_player.current_song['title']}]({bot.music_player.current_song['webpage_url']}) (`{duration_str}`) (Requested by {bot.music_player.current_song['requester'].mention})")
 
     if bot.music_player.song_queue_list:
         queue_display.append("\n**Up Next:**")
