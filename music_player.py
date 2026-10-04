@@ -6,6 +6,103 @@ import datetime
 import time
 import os
 import shlex
+import ipaddress
+import re
+import socket
+import urllib.request
+from urllib.parse import urlsplit, urlunsplit
+from yt_dlp.networking._urllib import UrllibRH
+
+
+YOUTUBE_HOSTS = {'youtube.com', 'www.youtube.com', 'm.youtube.com',
+                 'music.youtube.com', 'youtu.be'}
+YOUTUBE_INPUT_ERROR = 'Only YouTube links and plain search terms are supported.'
+
+
+def youtube_url(value):
+    """Validate a watch/playlist URL before it is handed to an extractor."""
+    try:
+        parts = urlsplit(value)
+        if (parts.scheme not in ('http', 'https') or parts.hostname not in YOUTUBE_HOSTS
+                or parts.username is not None or parts.password is not None
+                or parts.port not in (None, 80, 443) or '\\' in value
+                or any(ord(c) < 32 for c in value)):
+            raise ValueError(YOUTUBE_INPUT_ERROR)
+        # Upgrade input to HTTPS; never follow a user-supplied insecure URL.
+        return urlunsplit(('https', parts.hostname, parts.path, parts.query, ''))
+    except ValueError:
+        raise ValueError(YOUTUBE_INPUT_ERROR) from None
+
+
+def normalize_youtube_input(value):
+    value = value.strip()
+    if value.startswith('<') and value.endswith('>'):
+        value = value[1:-1]
+    if not value or any(ord(c) < 32 for c in value) or '\\' in value:
+        raise ValueError(YOUTUBE_INPUT_ERROR)
+    if value.startswith('//'):
+        return youtube_url('https:' + value)
+    if re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*:', value):
+        return youtube_url(value)
+    first = value.split('/', 1)[0].split('?', 1)[0]
+    if first in YOUTUBE_HOSTS:
+        return youtube_url('https://' + value)
+    # Treat URL-looking text as a URL, never as an implicit extractor directive.
+    if (re.match(r'^[^\s/]+\.[^\s/]+(?:[/?]|$)', value)
+            or re.match(r'^(?:localhost|\[)[^\s]*', value, re.I)):
+        raise ValueError(YOUTUBE_INPUT_ERROR)
+    return 'ytsearch1:' + value
+
+
+def validate_public_destination(url):
+    """Check every extraction request/redirect, including YouTube CDN requests."""
+    parts = urlsplit(url)
+    host = parts.hostname or ''
+    trusted = (host in YOUTUBE_HOSTS or host == 'youtubei.googleapis.com'
+               or any(host == domain or host.endswith('.' + domain)
+                      for domain in ('youtube.com', 'googlevideo.com', 'ytimg.com')))
+    if (parts.scheme != 'https' or not trusted or parts.port not in (None, 443)
+            or parts.username is not None or parts.password is not None):
+        raise ValueError('Blocked a request outside YouTube and its media services.')
+    try:
+        addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except OSError as error:
+        raise ValueError('Could not resolve the YouTube server. Please try again.') from error
+    if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
+        raise ValueError('Blocked a YouTube server resolving to a private/internal address.')
+
+
+class _PublicYouTubeRequests(urllib.request.BaseHandler):
+    def https_request(self, request):
+        validate_public_destination(request.full_url)
+        return request
+
+    http_request = https_request
+
+
+class _YouTubeUrllibRH(UrllibRH):
+    def _create_instance(self, *args, **kwargs):
+        opener = super()._create_instance(*args, **kwargs)
+        # urllib runs request processors again on redirect destinations.
+        opener.add_handler(_PublicYouTubeRequests())
+        return opener
+
+    def _send(self, request):
+        validate_public_destination(request.url)
+        return super()._send(request)
+
+
+class YouTubeDL(youtube_dl.YoutubeDL):
+    def build_request_director(self, handlers, preferences=None):
+        # Do not allow an alternate transport to bypass the redirect guard.
+        return super().build_request_director([_YouTubeUrllibRH])
+
+
+def extract_youtube_info(extractor, query):
+    if not query.startswith('ytsearch1:'):
+        query = youtube_url(query)
+        validate_public_destination(query)
+    return extractor.extract_info(query, download=False)
 
 # --- Global Constants for MusicPlayer (can be shared with cog if needed) ---
 EMBED_COLOR = discord.Color(0xFFB6C1) # Light Pink
@@ -48,6 +145,7 @@ class MusicPlayer:
         self.song_queue_list = collections.deque() 
         self.current_song = None
         self.voice_client = None
+        self.voice_connection_lock = asyncio.Lock()
         self.is_playing = False
         self.skip_votes = {}
         self.skip_required = 0
@@ -63,12 +161,13 @@ class MusicPlayer:
             'audioformat': 'mp3',
             'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
             'restrictfilenames': True,
-            'nocheckcertificate': True,
             'ignoreerrors': False,
             'logtostderr': False,
             'quiet': True,
             'no_warnings': True,
-            'default_search': 'auto',
+            'default_search': 'error',
+            'allowed_extractors': ['youtube.*'],
+            'proxy': '',
             # Node is opt-in in yt-dlp; keep Deno available where installed.
             'js_runtimes': {'deno': {}, 'node': {}},
             'source_address': '0.0.0.0',
@@ -109,7 +208,7 @@ class MusicPlayer:
         else:
             print("FFMPEG_PATH not set in .env. Assuming ffmpeg is in system PATH.")
 
-        self.yt_dlp = youtube_dl.YoutubeDL(self.YTDL_OPTIONS)
+        self.yt_dlp = YouTubeDL(self.YTDL_OPTIONS)
         self.audio_player_task = bot.loop.create_task(self.audio_player_loop())
 
     async def _update_now_playing_progress(self, song_info, message):
@@ -246,9 +345,9 @@ class MusicPlayer:
                         color=EMBED_COLOR
                     ))
                     
-                    ytdl_single_video = youtube_dl.YoutubeDL(self.YTDL_OPTIONS.copy())
+                    ytdl_single_video = YouTubeDL(self.YTDL_OPTIONS.copy())
                     full_song_data = await self.bot.loop.run_in_executor(
-                        None, lambda: ytdl_single_video.extract_info(song['webpage_url'], download=False)
+                        None, lambda: extract_youtube_info(ytdl_single_video, song['webpage_url'])
                     )
 
                     # stop() can clear the current song while the executor runs.
@@ -334,7 +433,12 @@ class MusicPlayer:
         """
         Adds a song or playlist to the queue.
         """
-        print(f"DEBUG: add_to_queue called with URL: {url}")
+        try:
+            query = normalize_youtube_input(url)
+        except ValueError as error:
+            await ctx.send(embed=discord.Embed(title=f"{EMOJI_ERROR} Unsupported Link",
+                                              description=str(error), color=EMBED_COLOR))
+            return
         try:
             ytdl_options_for_playlist_info = self.YTDL_OPTIONS.copy()
             ytdl_options_for_playlist_info['noplaylist'] = False
@@ -342,11 +446,11 @@ class MusicPlayer:
             if 'postprocessors' in ytdl_options_for_playlist_info:
                 del ytdl_options_for_playlist_info['postprocessors']
 
-            yt_dlp_instance_for_playlist = youtube_dl.YoutubeDL(ytdl_options_for_playlist_info)
+            yt_dlp_instance_for_playlist = YouTubeDL(ytdl_options_for_playlist_info)
 
             try:
                 data = await asyncio.wait_for(
-                    self.bot.loop.run_in_executor(None, lambda: yt_dlp_instance_for_playlist.extract_info(url, download=False)),
+                    self.bot.loop.run_in_executor(None, lambda: extract_youtube_info(yt_dlp_instance_for_playlist, query)),
                     timeout=180
                 )
             except asyncio.TimeoutError:
@@ -369,7 +473,7 @@ class MusicPlayer:
                     if entry and entry.get('url'):
                         song_info = {
                             'title': entry.get('title', f"Song {i+1} (Fetching...)"),
-                            'webpage_url': entry['url'],
+                            'webpage_url': youtube_url(entry['url']),
                             'duration': None,
                             'channel': ctx.channel,
                             'requester': ctx.author
@@ -397,7 +501,7 @@ class MusicPlayer:
             elif data:
                 song_info = {
                     'title': data.get('title', 'Unknown Title'),
-                    'webpage_url': data.get('webpage_url'),
+                    'webpage_url': youtube_url(data.get('webpage_url') or ''),
                     'duration': data.get('duration'),
                     'channel': ctx.channel,
                     'requester': ctx.author
@@ -482,6 +586,9 @@ class MusicPlayer:
                     break
             self.song_queue_list.clear()
             self.current_song = None
+            self.skip_votes.clear()
+            self.skip_required = 0
+            self.now_playing_message = None
             if self.progress_update_task and not self.progress_update_task.done():
                 self.progress_update_task.cancel()
                 self.progress_update_task = None

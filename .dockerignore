@@ -14,4 +14,3 @@ tests/
 .aws/
 *.log
 README.md
-requirements.txt

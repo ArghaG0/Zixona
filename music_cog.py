@@ -109,58 +109,101 @@ class QueueView(discord.ui.View):
 class MusicCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        # Initialize the MusicPlayer instance
-        self.player = MusicPlayer(bot)
+        # Retain one player per guild until this cog unloads. Replacing players
+        # on stop would race with in-flight extraction and audio callbacks.
+        self.players: dict[int, MusicPlayer] = {}
 
-    @commands.command(name='play', help=f'Plays a song from YouTube (or other platforms). If a song is playing, it adds to queue. Usage: `zix play <URL or search term>`')
+    def get_player(self, ctx):
+        """Resolve guild ownership before accessing any playback state."""
+        if ctx.guild is None:
+            raise commands.NoPrivateMessage()
+        guild_id = ctx.guild.id
+        # No await between lookup and insertion: concurrent commands in the
+        # event loop cannot create two players for the same guild here.
+        if guild_id not in self.players:
+            self.players[guild_id] = MusicPlayer(self.bot)
+        return self.players[guild_id]
+
+    async def check_voice_access(self, ctx, player, *, allow_join=False):
+        """Shared guard for commands that modify playback; no moderator bypass."""
+        if ctx.guild is None:
+            raise commands.NoPrivateMessage()
+        user_voice = getattr(ctx.author, 'voice', None)
+        user_channel = user_voice.channel if user_voice else None
+        voice = player.voice_client
+        connected = voice is not None and voice.is_connected()
+        if user_channel is None:
+            message = "Join my voice channel to control playback." if connected else "Join a voice channel first."
+        elif connected and user_channel != voice.channel:
+            message = ("I'm busy in another voice channel. Join that channel to add music."
+                       if allow_join else "You must be in my voice channel to control playback.")
+        elif not connected and not allow_join:
+            message = "I'm not connected to a voice channel. Use `zix play` to start a session."
+        else:
+            return True
+        await ctx.send(embed=discord.Embed(
+            title=f"{EMOJI_ERROR} Voice Channel Required",
+            description=message, color=EMBED_COLOR))
+        return False
+
+    async def cog_unload(self):
+        players = list(self.players.values())
+        self.players.clear()
+        tasks = [task for player in players
+                 for task in (player.audio_player_task, player.progress_update_task)
+                 if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*(player.disconnect_from_voice() for player in players))
+
+    @commands.command(name='play', usage='<URL or search term>', help='Plays a song from YouTube (or other platforms). If a song is playing, it adds to queue.')
     async def play(self, ctx, *, url):
         """
         Plays a song. If a song is already playing, it adds it to the queue.
         Supports YouTube URLs, playlists, or search terms. Automatically joins VC.
         """
-        print(f"DEBUG: 'zix play' command received with URL/search: {url}")
-        if not ctx.author.voice:
-            embed = discord.Embed(
-                title=f"{EMOJI_ERROR} Voice Channel Required",
-                description="You are not in a voice channel. Please join one first.",
-                color=EMBED_COLOR
-            )
-            return await ctx.send(embed=embed)
+        player = self.get_player(ctx)
+        async with player.voice_connection_lock:
+            if not await self.check_voice_access(ctx, player, allow_join=True):
+                return
+            channel = ctx.author.voice.channel
+            if player.voice_client is None or player.voice_client.channel != channel:
+                try:
+                    await player.connect_to_voice(channel)
+                    embed = discord.Embed(
+                        title=f"{EMOJI_JOINED} Joined Voice Channel",
+                        description=f"Joined voice channel: **{channel.name}**",
+                        color=EMBED_COLOR
+                    )
+                    await ctx.send(embed=embed)
+                except Exception as e:
+                    embed = discord.Embed(
+                        title=f"{EMOJI_ERROR} Connection Error",
+                        description=f"Could not connect to voice channel: `{e}`",
+                        color=EMBED_COLOR
+                    )
+                    return await ctx.send(embed=embed)
 
-        channel = ctx.author.voice.channel
-        if self.player.voice_client is None or self.player.voice_client.channel != channel:
-            try:
-                await self.player.connect_to_voice(channel)
-                embed = discord.Embed(
-                    title=f"{EMOJI_JOINED} Joined Voice Channel",
-                    description=f"Joined voice channel: **{channel.name}**",
-                    color=EMBED_COLOR
-                )
-                await ctx.send(embed=embed)
-            except Exception as e:
+            if not player.voice_client:
                 embed = discord.Embed(
                     title=f"{EMOJI_ERROR} Connection Error",
-                    description=f"Could not connect to voice channel: `{e}`",
+                    description="I could not connect to a voice channel. Please try again.",
                     color=EMBED_COLOR
                 )
                 return await ctx.send(embed=embed)
 
-        if not self.player.voice_client:
-            embed = discord.Embed(
-                title=f"{EMOJI_ERROR} Connection Error",
-                description="I could not connect to a voice channel. Please try again.",
-                color=EMBED_COLOR
-            )
-            return await ctx.send(embed=embed)
+        await player.add_to_queue(ctx, url)
 
-        await self.player.add_to_queue(ctx, url)
-
-    @commands.command(name='pause', help=f'Pauses the current song. Usage: `zix pause`')
+    @commands.command(name='pause', help='Pauses the current song.')
     async def pause(self, ctx):
         """
         Pauses the currently playing song.
         """
-        if not self.player.voice_client or not self.player.voice_client.is_playing():
+        player = self.get_player(ctx)
+        if not await self.check_voice_access(ctx, player):
+            return
+        if not player.voice_client or not player.voice_client.is_playing():
             embed = discord.Embed(
                 title=f"{EMOJI_ERROR} Nothing Playing",
                 description="No song is currently playing to pause.",
@@ -168,7 +211,7 @@ class MusicCog(commands.Cog):
             )
             return await ctx.send(embed=embed)
         
-        if self.player.voice_client.is_paused():
+        if player.voice_client.is_paused():
             embed = discord.Embed(
                 title=f"{EMOJI_PAUSED} Already Paused",
                 description="The song is already paused.",
@@ -176,13 +219,13 @@ class MusicCog(commands.Cog):
             )
             return await ctx.send(embed=embed)
 
-        self.player.voice_client.pause()
-        self.player.is_playing = False
-        if self.player.playback_start_time != 0:
-            self.player.paused_at_time = time.time() - self.player.playback_start_time
-        if self.player.progress_update_task and not self.player.progress_update_task.done():
-            self.player.progress_update_task.cancel()
-            self.player.progress_update_task = None
+        player.voice_client.pause()
+        player.is_playing = False
+        if player.playback_start_time != 0:
+            player.paused_at_time = time.time() - player.playback_start_time
+        if player.progress_update_task and not player.progress_update_task.done():
+            player.progress_update_task.cancel()
+            player.progress_update_task = None
         embed = discord.Embed(
             title=f"{EMOJI_PAUSED} Playback Paused",
             description="The current song has been paused.",
@@ -190,12 +233,15 @@ class MusicCog(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    @commands.command(name='resume', help=f'Resumes the paused song. Usage: `zix resume`')
+    @commands.command(name='resume', help='Resumes the paused song.')
     async def resume(self, ctx):
         """
         Resumes the currently paused song.
         """
-        if not self.player.voice_client or not self.player.voice_client.is_paused():
+        player = self.get_player(ctx)
+        if not await self.check_voice_access(ctx, player):
+            return
+        if not player.voice_client or not player.voice_client.is_paused():
             embed = discord.Embed(
                 title=f"{EMOJI_ERROR} Nothing Paused",
                 description="No song is currently paused to resume.",
@@ -203,17 +249,17 @@ class MusicCog(commands.Cog):
             )
             return await ctx.send(embed=embed)
 
-        self.player.voice_client.resume()
-        self.player.is_playing = True
-        self.player.playback_start_time = time.time() - self.player.paused_at_time
-        if self.player.current_song and self.player.now_playing_message and self.player.progress_update_task is None:
-            if self.player.current_song.get('duration') is not None and self.player.current_song.get('duration') > 0:
-                print(f"DEBUG: Restarting progress update task for {self.player.current_song['title']}.")
-                self.player.progress_update_task = self.bot.loop.create_task(
-                    self.player._update_now_playing_progress(self.player.current_song, self.player.now_playing_message)
+        player.voice_client.resume()
+        player.is_playing = True
+        player.playback_start_time = time.time() - player.paused_at_time
+        if player.current_song and player.now_playing_message and player.progress_update_task is None:
+            if player.current_song.get('duration') is not None and player.current_song.get('duration') > 0:
+                print(f"DEBUG: Restarting progress update task for {player.current_song['title']}.")
+                player.progress_update_task = self.bot.loop.create_task(
+                    player._update_now_playing_progress(player.current_song, player.now_playing_message)
                 )
             else:
-                print(f"DEBUG: Not restarting progress update task for {self.player.current_song['title']} due to missing/zero duration.")
+                print(f"DEBUG: Not restarting progress update task for {player.current_song['title']} due to missing/zero duration.")
 
         embed = discord.Embed(
             title=f"{EMOJI_PLAYING} Playback Resumed",
@@ -222,12 +268,15 @@ class MusicCog(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    @commands.command(name='skip', help=f'Skips the current song. Usage: `zix skip`')
+    @commands.command(name='skip', help='Skips the current song.')
     async def skip(self, ctx):
         """
         Skips the current song.
         """
-        if not self.player.is_playing and self.player.queue.empty():
+        player = self.get_player(ctx)
+        if not await self.check_voice_access(ctx, player):
+            return
+        if not player.is_playing and player.queue.empty():
             embed = discord.Embed(
                 title=f"{EMOJI_ERROR} No Song Playing",
                 description="No song is currently playing or in the queue to skip.",
@@ -235,7 +284,7 @@ class MusicCog(commands.Cog):
             )
             return await ctx.send(embed=embed)
 
-        if not self.player.voice_client:
+        if not player.voice_client:
             embed = discord.Embed(
                 title=f"{EMOJI_ERROR} Not Connected",
                 description="I am not in a voice channel.",
@@ -243,20 +292,20 @@ class MusicCog(commands.Cog):
             )
             return await ctx.send(embed=embed)
 
-        members_in_vc = [m for m in self.player.voice_client.channel.members if not m.bot]
+        members_in_vc = [m for m in player.voice_client.channel.members if not m.bot]
         if len(members_in_vc) > 1:
-            if ctx.author.id not in self.player.skip_votes:
-                self.player.skip_votes[ctx.author.id] = True
-                self.player.skip_required = len(members_in_vc) // 2 + 1
-                current_votes = len(self.player.skip_votes)
+            if ctx.author.id not in player.skip_votes:
+                player.skip_votes[ctx.author.id] = True
+                player.skip_required = len(members_in_vc) // 2 + 1
+                current_votes = len(player.skip_votes)
                 embed = discord.Embed(
                     title=f"{EMOJI_VOTE} Skip Vote",
-                    description=f"Skip vote added by {ctx.author.display_name}. {current_votes}/{self.player.skip_required} votes to skip.",
+                    description=f"Skip vote added by {ctx.author.display_name}. {current_votes}/{player.skip_required} votes to skip.",
                     color=EMBED_COLOR
                 )
                 await ctx.send(embed=embed)
-                if current_votes >= self.player.skip_required:
-                    self.player.voice_client.stop()
+                if current_votes >= player.skip_required:
+                    player.voice_client.stop()
                     embed = discord.Embed(
                         title=f"{EMOJI_SKIPPED} Song Skipped!",
                         description="The song has been skipped by popular vote.",
@@ -271,7 +320,7 @@ class MusicCog(commands.Cog):
                 )
                 await ctx.send(embed=embed)
         else:
-            self.player.voice_client.stop()
+            player.voice_client.stop()
             embed = discord.Embed(
                 title=f"{EMOJI_SKIPPED} Song Skipped!",
                 description="The song has been skipped.",
@@ -279,12 +328,15 @@ class MusicCog(commands.Cog):
             )
             await ctx.send(embed=embed)
 
-    @commands.command(name='stop', help=f'Stops the current song, clears the queue, and leaves the voice channel. Usage: `zix stop`')
+    @commands.command(name='stop', help='Stops the current song, clears the queue, and leaves the voice channel.')
     async def stop(self, ctx):
         """
         Stops the current song, clears the entire queue, and leaves the voice channel.
         """
-        if not self.player.voice_client:
+        player = self.get_player(ctx)
+        if not await self.check_voice_access(ctx, player):
+            return
+        if not player.voice_client:
             embed = discord.Embed(
                 title=f"{EMOJI_ERROR} Not Playing",
                 description="I am not currently playing anything or in a voice channel.",
@@ -292,8 +344,8 @@ class MusicCog(commands.Cog):
             )
             return await ctx.send(embed=embed)
 
-        if self.player.voice_client.is_playing() or self.player.voice_client.is_paused():
-            self.player.voice_client.stop()
+        if player.voice_client.is_playing() or player.voice_client.is_paused():
+            player.voice_client.stop()
             embed = discord.Embed(
                 title=f"{EMOJI_STOPPED} Playback Stopped",
                 description="Playback stopped.",
@@ -301,15 +353,15 @@ class MusicCog(commands.Cog):
             )
             await ctx.send(embed=embed)
 
-        while not self.player.queue.empty():
+        while not player.queue.empty():
             try:
-                self.player.queue.get_nowait()
+                player.queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-        self.player.song_queue_list.clear()
-        self.player.current_song = None
+        player.song_queue_list.clear()
+        player.current_song = None
         
-        if await self.player.disconnect_from_voice():
+        if await player.disconnect_from_voice():
             embed = discord.Embed(
                 title=f"{EMOJI_STOPPED} Disconnected",
                 description="The music queue has been cleared and I have left the voice channel.",
@@ -324,14 +376,15 @@ class MusicCog(commands.Cog):
             )
             await ctx.send(embed=embed)
 
-    @commands.command(name='queue', help=f'Shows the current music queue. Usage: `zix queue`')
+    @commands.command(name='queue', help='Shows the current music queue.')
     async def show_queue(self, ctx):
         """
         Displays the current songs in the queue with pagination.
         """
-        total_queue_items = len(self.player.song_queue_list)
+        player = self.get_player(ctx)
+        total_queue_items = len(player.song_queue_list)
         
-        if self.player.current_song:
+        if player.current_song:
             if total_queue_items == 0:
                 total_pages = 1
             else:
@@ -348,10 +401,10 @@ class MusicCog(commands.Cog):
             )
             return await ctx.send(embed=embed)
 
-        view = QueueView(ctx, self.player, total_pages)
+        view = QueueView(ctx, player, total_pages)
         view.message = await ctx.send(embed=view._generate_embed(), view=view)
 
-    @commands.command(name='help', help=f'Displays all available commands. Usage: `zix help`')
+    @commands.command(name='help', help='Displays all available commands.')
     async def help_command(self, ctx):
         """
         Displays all available commands and their descriptions.
@@ -365,7 +418,8 @@ class MusicCog(commands.Cog):
         for command in self.bot.commands:
             if command.hidden:
                 continue
-            embed.add_field(name=f"`{self.bot.command_prefix}{command.name}`", value=command.help or "No description provided.", inline=False)
+            syntax = f"{self.bot.command_prefix}{command.qualified_name} {command.signature}".rstrip()
+            embed.add_field(name=f"`{syntax}`", value=command.help or "No description provided.", inline=False)
         
         await ctx.send(embed=embed)
 
