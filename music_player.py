@@ -5,6 +5,7 @@ import collections
 import datetime
 import time
 import os
+import shlex
 
 # --- Global Constants for MusicPlayer (can be shared with cog if needed) ---
 EMBED_COLOR = discord.Color(0xFFB6C1) # Light Pink
@@ -68,6 +69,8 @@ class MusicPlayer:
             'quiet': True,
             'no_warnings': True,
             'default_search': 'auto',
+            # Node is opt-in in yt-dlp; keep Deno available where installed.
+            'js_runtimes': {'deno': {}, 'node': {}},
             'source_address': '0.0.0.0',
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
@@ -247,6 +250,13 @@ class MusicPlayer:
                     full_song_data = await self.bot.loop.run_in_executor(
                         None, lambda: ytdl_single_video.extract_info(song['webpage_url'], download=False)
                     )
+
+                    # stop() can clear the current song while the executor runs.
+                    # Threads cannot be safely cancelled: discard the stale result
+                    # and finish this queue item without starting any audio.
+                    if self.current_song is not song:
+                        self.queue.task_done()
+                        continue
                     
                     self.current_song['title'] = full_song_data.get('title', self.current_song.get('title', 'Unknown Title'))
                     self.current_song['duration'] = full_song_data.get('duration')
@@ -255,7 +265,16 @@ class MusicPlayer:
                     if not fresh_audio_url:
                         raise ValueError(f"Could not get fresh audio URL for {self.current_song['title']}")
 
-                    source = discord.FFmpegPCMAudio(fresh_audio_url, **self.FFMPEG_OPTIONS)
+                    ffmpeg_options = self.FFMPEG_OPTIONS.copy()
+                    headers = full_song_data.get('http_headers') or {}
+                    if headers:
+                        # discord.py parses before_options with shlex.split,
+                        # including on Windows. Keep the CRLF header block as
+                        # one argument, preserving spaces and quotes in values.
+                        header_block = ''.join(f'{name}: {value}\r\n'
+                                               for name, value in headers.items())
+                        ffmpeg_options['before_options'] += f' -headers {shlex.quote(header_block)}'
+                    source = discord.FFmpegPCMAudio(fresh_audio_url, **ffmpeg_options)
                     self.voice_client.play(source, after=lambda e: self.bot.loop.call_soon_threadsafe(self.play_next_song, e))
                     self.is_playing = True
                     self.playback_start_time = time.time()
@@ -278,13 +297,18 @@ class MusicPlayer:
                         print(f"Not starting progress update task for {self.current_song['title']} due to missing/zero duration.")
 
                 except Exception as e:
+                    # Extraction may also fail after stop(); do not dereference
+                    # cleared state or report an error for a cancelled song.
+                    if self.current_song is not song:
+                        self.queue.task_done()
+                        continue
                     print(f"Error playing song: {e}")
                     embed = discord.Embed(
                         title=f"{EMOJI_ERROR} Playback Error",
-                        description=f"Error playing **{self.current_song.get('title', 'a song')}**: `{e}`. Skipping to next song.",
+                        description=f"Error playing **{song.get('title', 'a song')}**: `{e}`. Skipping to next song.",
                         color=EMBED_COLOR
                     )
-                    await self.current_song['channel'].send(embed=embed)
+                    await song['channel'].send(embed=embed)
                     self.play_next_song(e)
             else:
                 print("Voice client not connected, skipping song.")

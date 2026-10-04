@@ -1,0 +1,17 @@
+.venv/
+venv/
+.git/
+.env
+.env.*
+__pycache__/
+**/__pycache__/
+*.py[cod]
+tests/
+.pytest_cache/
+.uv-cache/
+.codex/
+.agents/
+.aws/
+*.log
+README.md
+requirements.txt

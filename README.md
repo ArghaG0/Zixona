@@ -12,56 +12,67 @@ Zixona is a feature-rich Discord music bot designed to bring high-quality audio 
 * **Vote Skip:** Allow server members to vote to skip the current song.  
 * **Modular Design:** Built with discord.py cogs for easy extension and maintenance.
 
-## **Setup and Installation**
+## Setup with uv
 
-Follow these steps to get Zixona running on your server.
+Requires Python **3.13**, [uv](https://docs.astral.sh/uv/getting-started/installation/),
+FFmpeg on PATH, and **Node.js 22+** on PATH for yt-dlp's JavaScript challenges.
+The tested local versions are Python 3.13.5 and Node.js 22.18.0.
 
-### **Prerequisites**
+From the cloned repository, install the locked dependencies:
 
-Before you begin, ensure you have the following installed:
+```powershell
+uv sync --locked
+```
 
-* **Python 3.8+**: [Download Python](https://www.python.org/downloads/)  
-* **FFmpeg**: This is crucial for audio processing.  
-  * **Windows**: [Download from here](https://www.google.com/search?q=https://ffmpeg.org/download.html%23build-windows). Extract it and add the bin folder to your system's PATH, or note its full path for the .env file.  
-  * **Linux/macOS**: Install via your package manager (e.g., sudo apt install ffmpeg on Debian/Ubuntu, brew install ffmpeg on macOS).  
-* **Discord Bot Token**: Create a bot application and get your token from the [Discord Developer Portal](https://discord.com/developers/applications). Make sure to enable the Message Content Intent and Voice States in your bot's settings.  
-* **Bot Permissions**: Invite your bot to your server with necessary permissions (e.g., Connect, Speak, Send Messages, Read Message History).
+uv manages `.venv` automatically. `pyproject.toml` declares discord.py with voice
+support (including DAVE), yt-dlp with EJS, python-dotenv, and PyNaCl. `uv.lock`
+locks the complete dependency graph. No separate pip install is needed.
 
-### **Installation Steps**
+Create `.env` in the project root:
 
-1. **Clone the Repository:**  
-   git clone https://github.com/your-username/zixona-bot.git  
-   cd zixona-bot
+```dotenv
+DISCORD_BOT_TOKEN="YOUR_BOT_TOKEN"
+# Optional: absolute executable path; omit entirely when FFmpeg is on PATH.
+FFMPEG_PATH="C:/path/to/ffmpeg/bin/ffmpeg.exe"
+```
 
-   *(Replace your-username/zixona-bot.git with your actual repository URL once created)*  
-2. **Create a Virtual Environment (Recommended):**  
-   python \-m venv venv  
-   \# On Windows:  
-   .\\venv\\Scripts\\activate  
-   \# On macOS/Linux:  
-   source venv/bin/activate
+Enable Message Content Intent in the Discord Developer Portal. Invite the bot
+with Connect, Speak, Send Messages, Embed Links, and Read Message History permissions.
+Run:
 
-3. **Install Dependencies:**  
-   pip install \-r requirements.txt
+```powershell
+uv run main.py
+```
 
-   If you don't have a requirements.txt yet, create one with these contents:  
-   discord.py\[voice\]  
-   yt-dlp  
-   python-dotenv
+Stop an existing bot process before syncing dependencies or starting another copy.
 
-4. Create .env File:  
-   In the root directory of your bot (zixona-bot/), create a file named .env and add your bot token and FFmpeg path:  
-   DISCORD\_BOT\_TOKEN="YOUR\_DISCORD\_BOT\_TOKEN\_HERE"  
-   FFMPEG\_PATH="C:/path/to/ffmpeg/bin/ffmpeg.exe" \# Example for Windows, adjust for your OS  
-   \# For Linux/macOS, if ffmpeg is in your PATH, you can often leave this empty or set to just "ffmpeg"  
-   \# FFMPEG\_PATH="ffmpeg"
+## Docker
 
-   Replace YOUR\_DISCORD\_BOT\_TOKEN\_HERE with your actual bot token.  
-   Adjust FFMPEG\_PATH to the correct path for your FFmpeg executable. If FFmpeg is in your system's PATH, you might not need to specify the full path, but it's safer to do so.  
-5. **Run the Bot:**  
-   python main.py
+Install Docker with Linux container support. The image includes Python 3.13.5,
+Node.js 22.18.0, FFmpeg, and locked Python dependencies. It runs as a non-root user.
+The build excludes `.env`, local environments, Git data, and tests.
 
-   Your bot should now come online in your Discord server\!
+With your token in `.env`, run:
+
+```powershell
+docker compose up --build -d
+docker compose logs -f bot
+```
+
+Compose reads `.env` at runtime and overrides `FFMPEG_PATH` with
+`/usr/bin/ffmpeg`, so a Windows path in your local `.env` does not affect the
+container. No ports or volumes are required. Do not run the local bot and the
+container simultaneously with the same token.
+
+Stop the container:
+
+```powershell
+docker compose down
+```
+
+Startup verification should show a Discord connection and `MusicCog loaded
+successfully.` Real voice playback inside Docker must be tested manually in a
+Discord voice channel; a successful startup does not establish audio playback.
 
 ## **Bot Commands**
 
