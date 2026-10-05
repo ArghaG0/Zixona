@@ -344,6 +344,7 @@ class MusicCog(commands.Cog):
             )
             return await ctx.send(embed=embed)
 
+        player.invalidate_session()
         if player.voice_client.is_playing() or player.voice_client.is_paused():
             player.stop_audio()
             embed = discord.Embed(

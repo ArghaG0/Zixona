@@ -40,6 +40,10 @@ YOUTUBE_INPUT_ERROR = 'Only YouTube links and plain search terms are supported.'
 PLAYLIST_LIMIT = 500
 
 
+class ImportCancelled(Exception):
+    """The queue session ended while an import was in flight."""
+
+
 class CheckedAudioSource(discord.AudioSource):
     """Turn premature FFmpeg EOF into an error on Discord's audio thread."""
     def __init__(self, source, duration):
@@ -83,8 +87,9 @@ class CheckedAudioSource(discord.AudioSource):
 
 class PlaylistProgress:
     """Executor threads publish counters; only the event loop edits Discord."""
-    def __init__(self, message):
+    def __init__(self, message, cancelled=None):
         self.message = message
+        self.cancelled = cancelled
         self.lock = threading.Lock()
         self.title = 'playlist (fetching details)'
         self.total = None
@@ -93,6 +98,8 @@ class PlaylistProgress:
         self.last_edit = time.monotonic()
 
     def observe(self, info, extra=None):
+        if self.cancelled and self.cancelled.is_set():
+            raise ImportCancelled()
         extra = extra or {}
         with self.lock:
             if info.get('_type') == 'playlist':
@@ -103,6 +110,8 @@ class PlaylistProgress:
             self.processed = max(self.processed, min(extra.get('playlist_autonumber') or 0, PLAYLIST_LIMIT))
 
     async def refresh(self):
+        if self.cancelled and self.cancelled.is_set():
+            return
         with self.lock:
             count, title, total = self.processed, self.title, self.total
         now = time.monotonic()
@@ -224,6 +233,8 @@ class MusicPlayer:
     def __init__(self, bot):
         self.bot = bot
         self.queue = asyncio.Queue()
+        self.session_id = 0
+        self.session_cancelled = asyncio.Event()
         self.song_queue_list = collections.deque() 
         self.current_song = None
         self.voice_client = None
@@ -518,24 +529,45 @@ class MusicPlayer:
         self.playback_start_time = 0
         self.paused_at_time = 0
 
+    def invalidate_session(self):
+        """Synchronously invalidate all imports belonging to this guild session."""
+        self.session_id += 1
+        self.session_cancelled.set()
+        self.session_cancelled = asyncio.Event()
+
     async def add_to_queue(self, ctx, url):
         """
         Adds a song or playlist to the queue.
         """
         progress_message = None
         progress_task = None
+        session_id = self.session_id
+        cancelled = self.session_cancelled
+
+        def check_session():
+            if session_id != self.session_id:
+                raise ImportCancelled()
 
         async def report(embed):
+            nonlocal progress_message
             if progress_task:
                 progress_task.cancel()
                 await asyncio.gather(progress_task, return_exceptions=True)
+            reporting_cancellation = cancelled.is_set()
+            if reporting_cancellation:
+                embed = discord.Embed(title=f'{EMOJI_STOPPED} Cancelled',
+                                      description='Cancelled — stopped by user.', color=EMBED_COLOR)
             if progress_message is not None:
                 try:
                     await progress_message.edit(embed=embed)
+                    if cancelled.is_set() and not reporting_cancellation:
+                        await report(embed)
                     return
                 except discord.HTTPException:
                     pass
-            await ctx.send(embed=embed)
+            progress_message = await ctx.send(embed=embed)
+            if cancelled.is_set() and not reporting_cancellation:
+                await report(embed)
 
         try:
             query = normalize_youtube_input(url)
@@ -552,7 +584,8 @@ class MusicPlayer:
                     title=f'{EMOJI_FETCHING} Adding Songs',
                     description='Adding songs from playlist: fetching title... (0/?)\nLimit: first 500 entries.',
                     color=EMBED_COLOR))
-                progress = PlaylistProgress(progress_message)
+                check_session()
+                progress = PlaylistProgress(progress_message, cancelled)
                 progress_task = self.bot.loop.create_task(progress.run())
             ytdl_options_for_playlist_info = self.YTDL_OPTIONS.copy()
             ytdl_options_for_playlist_info['noplaylist'] = False
@@ -568,11 +601,16 @@ class MusicPlayer:
             yt_dlp_instance_for_playlist = YouTubeDL(ytdl_options_for_playlist_info)
             yt_dlp_instance_for_playlist.playlist_progress = progress
 
-            try:
-                data = await asyncio.wait_for(
+            check_session()
+            extraction = asyncio.ensure_future(asyncio.wait_for(
                     self.bot.loop.run_in_executor(None, lambda: extract_youtube_info(yt_dlp_instance_for_playlist, query)),
                     timeout=180
-                )
+                ))
+            cancellation = asyncio.create_task(cancelled.wait())
+            try:
+                await asyncio.wait((extraction, cancellation), return_when=asyncio.FIRST_COMPLETED)
+                check_session()
+                data = await extraction
             except asyncio.TimeoutError:
                 embed = discord.Embed(
                     title=f"{EMOJI_ERROR} Extraction Timeout",
@@ -582,6 +620,14 @@ class MusicPlayer:
                 await report(embed)
                 print(f"DEBUG: Extraction Timeout for URL: {url}")
                 return
+            finally:
+                # Cancelling the future cannot kill an executor thread. Its
+                # eventual result is discarded and cannot mutate the queue.
+                extraction.cancel()
+                cancellation.cancel()
+                await asyncio.gather(extraction, cancellation, return_exceptions=True)
+
+            check_session()
 
             print(f"DEBUG: Raw data extracted by yt-dlp: {data.keys() if isinstance(data, dict) else data}")
 
@@ -590,6 +636,7 @@ class MusicPlayer:
                 playlist_title = data.get('title', 'Unknown Playlist')
                 processed = unavailable = 0
                 for i, entry in enumerate(islice(data['entries'], PLAYLIST_LIMIT)):
+                    check_session()
                     processed += 1
                     try:
                         if (not entry or not entry.get('url')
@@ -656,8 +703,11 @@ class MusicPlayer:
                 return
 
             for song_info in songs_to_add:
+                check_session()
                 if song_info['webpage_url']:
-                    await self.queue.put(song_info)
+                    # The unbounded queue and display list are updated atomically
+                    # on the event loop, without yielding between guard and put.
+                    self.queue.put_nowait(song_info)
                     self.song_queue_list.append(song_info)
                     print(f"DEBUG: Successfully put '{song_info['title']}' into internal queues.")
                 else:
@@ -665,6 +715,8 @@ class MusicPlayer:
             if data and 'entries' in data:
                 await report(completion_embed)
 
+        except ImportCancelled:
+            await report(discord.Embed(title='Cancelled', color=EMBED_COLOR))
         except youtube_dl.DownloadError as e:
             embed = discord.Embed(
                 title=f"{EMOJI_ERROR} Download Error",
