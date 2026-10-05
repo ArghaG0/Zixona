@@ -2,8 +2,8 @@ import discord
 from discord.ext import commands
 import asyncio
 import time
-# Import the MusicPlayer class and format_duration function from the new music_player.py file
-from music_player import MusicPlayer, format_duration, EMBED_COLOR, EMOJI_ERROR, EMOJI_PLAYING, EMOJI_PAUSED, EMOJI_ADDED, EMOJI_SKIPPED, EMOJI_STOPPED, EMOJI_JOINED, EMOJI_DISCONNECTED, EMOJI_FETCHING, EMOJI_QUEUE, EMOJI_VOTE, EMOJI_HELP, EMOJI_PLAYLIST
+from zixona.player import MusicPlayer
+from zixona.presentation import format_duration, EMBED_COLOR, EMOJI_ERROR, EMOJI_PLAYING, EMOJI_PAUSED, EMOJI_ADDED, EMOJI_SKIPPED, EMOJI_STOPPED, EMOJI_JOINED, EMOJI_DISCONNECTED, EMOJI_FETCHING, EMOJI_QUEUE, EMOJI_VOTE, EMOJI_HELP, EMOJI_PLAYLIST
 
 
 # --- Queue View for Pagination ---
@@ -157,7 +157,7 @@ class MusicCog(commands.Cog):
         await asyncio.gather(*tasks, return_exceptions=True)
         await asyncio.gather(*(player.disconnect_from_voice() for player in players))
 
-    @commands.command(name='play', usage='<URL or search term>', help='Plays a song from YouTube (or other platforms). If a song is playing, it adds to queue.')
+    @commands.command(name='play', usage='<YouTube URL or search term>', help='Plays a song from YouTube. If a song is playing, it adds to queue.')
     async def play(self, ctx, *, url):
         """
         Plays a song. If a song is already playing, it adds it to the queue.
@@ -305,7 +305,7 @@ class MusicCog(commands.Cog):
                 )
                 await ctx.send(embed=embed)
                 if current_votes >= player.skip_required:
-                    player.voice_client.stop()
+                    player.stop_audio()
                     embed = discord.Embed(
                         title=f"{EMOJI_SKIPPED} Song Skipped!",
                         description="The song has been skipped by popular vote.",
@@ -320,7 +320,7 @@ class MusicCog(commands.Cog):
                 )
                 await ctx.send(embed=embed)
         else:
-            player.voice_client.stop()
+            player.stop_audio()
             embed = discord.Embed(
                 title=f"{EMOJI_SKIPPED} Song Skipped!",
                 description="The song has been skipped.",
@@ -345,7 +345,7 @@ class MusicCog(commands.Cog):
             return await ctx.send(embed=embed)
 
         if player.voice_client.is_playing() or player.voice_client.is_paused():
-            player.voice_client.stop()
+            player.stop_audio()
             embed = discord.Embed(
                 title=f"{EMOJI_STOPPED} Playback Stopped",
                 description="Playback stopped.",

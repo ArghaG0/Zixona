@@ -1,22 +1,129 @@
+from zixona.config import ffmpeg_options, ffmpeg_path_is_configured
+from zixona.presentation import (
+    format_duration,
+    EMBED_COLOR,
+    EMOJI_PLAYING,
+    EMOJI_PAUSED,
+    EMOJI_ADDED,
+    EMOJI_SKIPPED,
+    EMOJI_STOPPED,
+    EMOJI_JOINED,
+    EMOJI_DISCONNECTED,
+    EMOJI_ERROR,
+    EMOJI_FETCHING,
+    EMOJI_QUEUE,
+    EMOJI_VOTE,
+    EMOJI_HELP,
+    EMOJI_PLAYLIST,
+)
+
 import discord
 import yt_dlp as youtube_dl
 import asyncio
 import collections
-import datetime
 import time
-import os
 import shlex
 import ipaddress
 import re
 import socket
 import urllib.request
-from urllib.parse import urlsplit, urlunsplit
+import threading
+import subprocess
+from itertools import islice
+from urllib.parse import urlsplit, urlunsplit, parse_qs
 from yt_dlp.networking._urllib import UrllibRH
 
 
 YOUTUBE_HOSTS = {'youtube.com', 'www.youtube.com', 'm.youtube.com',
                  'music.youtube.com', 'youtu.be'}
 YOUTUBE_INPUT_ERROR = 'Only YouTube links and plain search terms are supported.'
+PLAYLIST_LIMIT = 500
+
+
+class CheckedAudioSource(discord.AudioSource):
+    """Turn premature FFmpeg EOF into an error on Discord's audio thread."""
+    def __init__(self, source, duration):
+        self.source = source
+        self.duration = duration
+        self.frames = 0
+        self.cancelled = False
+
+    def read(self):
+        data = self.source.read()
+        if self.cancelled:
+            return b''
+        if data:
+            self.frames += 1
+            return data
+        # stdout can close just before poll() sees the exit code. Wait briefly
+        # here, on the audio thread, before Discord cleans up the subprocess.
+        process = self.source._process
+        try:
+            code = process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            code = None
+        if self.cancelled:
+            return b''
+        if code not in (None, 0):
+            reason = ' (HTTP 403: media server refused access)' if code & 0xffffffff == 3436169992 else ''
+            raise RuntimeError(f'FFmpeg exited with code {code}{reason}')
+        seconds = self.frames * 0.02
+        if (not self.frames or (self.duration and self.duration > 0
+                               and seconds < min(30, self.duration * 0.5))):
+            raise RuntimeError(f'Audio stream ended unexpectedly after {seconds:.1f} seconds of decoded audio')
+        return b''
+
+    def is_opus(self):
+        return self.source.is_opus()
+
+    def cleanup(self):
+        self.cancelled = True
+        self.source.cleanup()
+
+
+class PlaylistProgress:
+    """Executor threads publish counters; only the event loop edits Discord."""
+    def __init__(self, message):
+        self.message = message
+        self.lock = threading.Lock()
+        self.title = 'playlist (fetching details)'
+        self.total = None
+        self.processed = 0
+        self.last_count = 0
+        self.last_edit = time.monotonic()
+
+    def observe(self, info, extra=None):
+        extra = extra or {}
+        with self.lock:
+            if info.get('_type') == 'playlist':
+                self.title = info.get('title') or self.title
+                self.total = info.get('playlist_count') or self.total
+            self.title = extra.get('playlist_title') or self.title
+            self.total = extra.get('playlist_count') or self.total
+            self.processed = max(self.processed, min(extra.get('playlist_autonumber') or 0, PLAYLIST_LIMIT))
+
+    async def refresh(self):
+        with self.lock:
+            count, title, total = self.processed, self.title, self.total
+        now = time.monotonic()
+        # Both gates must pass: at least 20 entries AND at least 2 seconds.
+        if count - self.last_count < 20 or now - self.last_edit < 2:
+            return
+        denominator = min(total, PLAYLIST_LIMIT) if isinstance(total, int) else '?'
+        await self.message.edit(embed=discord.Embed(
+            title=f'{EMOJI_FETCHING} Adding Songs',
+            description=f'Adding songs from playlist: **{title[:200]}**... ({count}/{denominator})',
+            color=EMBED_COLOR))
+        self.last_count, self.last_edit = count, now
+
+    async def run(self):
+        try:
+            while True:
+                await asyncio.sleep(2)
+                await self.refresh()
+        except discord.HTTPException:
+            # A removed message or edit failure must not cancel extraction.
+            return
 
 
 def youtube_url(value):
@@ -68,7 +175,8 @@ def validate_public_destination(url):
         addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
     except OSError as error:
         raise ValueError('Could not resolve the YouTube server. Please try again.') from error
-    if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
+    ips = [ipaddress.ip_address(a[4][0]) for a in addresses]
+    if not ips or any(not ip.is_global or ip.is_multicast or ip.is_reserved for ip in ips):
         raise ValueError('Blocked a YouTube server resolving to a private/internal address.')
 
 
@@ -93,6 +201,13 @@ class _YouTubeUrllibRH(UrllibRH):
 
 
 class YouTubeDL(youtube_dl.YoutubeDL):
+    playlist_progress = None
+
+    def process_ie_result(self, ie_result, download=True, extra_info=None):
+        if self.playlist_progress:
+            self.playlist_progress.observe(ie_result, extra_info)
+        return super().process_ie_result(ie_result, download, extra_info)
+
     def build_request_director(self, handlers, preferences=None):
         # Do not allow an alternate transport to bypass the redirect guard.
         return super().build_request_director([_YouTubeUrllibRH])
@@ -104,39 +219,6 @@ def extract_youtube_info(extractor, query):
         validate_public_destination(query)
     return extractor.extract_info(query, download=False)
 
-# --- Global Constants for MusicPlayer (can be shared with cog if needed) ---
-EMBED_COLOR = discord.Color(0xFFB6C1) # Light Pink
-
-EMOJI_PLAYING = "<a:MusicalHearts:1393976474888966308>"
-EMOJI_PAUSED = "<:Spotify_Pause:1393976498179936317>"
-EMOJI_ADDED = "<:pinkcheckmark:1393976477262807100>"
-EMOJI_SKIPPED = "<:Skip:1393976495155839099>"
-EMOJI_STOPPED = "⏹️"
-EMOJI_JOINED = "<:screenshare_volume_max:1393976485643030661>"
-EMOJI_DISCONNECTED = "<:SilverMute:1393976492261769247>"
-EMOJI_ERROR = "<:pinkcrossmark:1393976480014401586>"
-EMOJI_FETCHING = "<:SearchCloud:1393976489564700712>"
-EMOJI_QUEUE = "<:Spotify_Queue:1393976501090783283>"
-EMOJI_VOTE = "<:downvote:1393976467196481678>"
-EMOJI_HELP = "<:pinkquestionmark:1393976483118055475>"
-EMOJI_PLAYLIST = "<:list:1393976471193784352>"
-
-# --- Helper Function for Duration Formatting ---
-def format_duration(seconds):
-    """Formats duration in seconds to HH:MM:SS or MM:SS."""
-    if seconds is None:
-        return "N/A"
-    
-    td = datetime.timedelta(seconds=int(seconds))
-    
-    hours, remainder = divmod(td.seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-
-    if hours > 0:
-        return f"{hours:02}:{minutes:02}:{seconds:02}"
-    else:
-        return f"{minutes:02}:{seconds:02}"
-
 # --- Audio Player Class ---
 class MusicPlayer:
     def __init__(self, bot):
@@ -145,6 +227,7 @@ class MusicPlayer:
         self.song_queue_list = collections.deque() 
         self.current_song = None
         self.voice_client = None
+        self.active_audio_source = None
         self.voice_connection_lock = asyncio.Lock()
         self.is_playing = False
         self.skip_votes = {}
@@ -178,35 +261,7 @@ class MusicPlayer:
             }],
         }
 
-        # FFmpeg options for playing audio
-        self.FFMPEG_OPTIONS = {
-            'options': '-vn',
-            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
-        }
-
-        # Get FFMPEG_PATH from environment variables
-        ffmpeg_path = os.getenv('FFMPEG_PATH')
-        if ffmpeg_path:
-            normalized_ffmpeg_path = os.path.normpath(ffmpeg_path)
-            if os.path.isdir(normalized_ffmpeg_path):
-                ffmpeg_executable_name = 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg'
-                ffmpeg_executable_path = os.path.join(normalized_ffmpeg_path, ffmpeg_executable_name)
-                if not os.path.exists(ffmpeg_executable_path):
-                    print(f"Warning: FFmpeg executable '{ffmpeg_executable_name}' not found in '{normalized_ffmpeg_path}'.")
-                    print("Please ensure FFMPEG_PATH in your .env file points directly to ffmpeg.exe or its containing directory.")
-                    self.FFMPEG_OPTIONS['executable'] = None
-                else:
-                    self.FFMPEG_OPTIONS['executable'] = ffmpeg_executable_path
-                    print(f"FFmpeg executable path adjusted to: {self.FFMPEG_OPTIONS['executable']}")
-            else:
-                self.FFMPEG_OPTIONS['executable'] = normalized_ffmpeg_path
-            
-            if self.FFMPEG_OPTIONS.get('executable') and not os.path.exists(self.FFMPEG_OPTIONS['executable']):
-                print(f"Warning: FFmpeg executable not found at '{self.FFMPEG_OPTIONS['executable']}'.")
-                print("Please ensure FFMPEG_PATH in your .env file points directly to ffmpeg.exe or its containing directory.")
-                self.FFMPEG_OPTIONS['executable'] = None
-        else:
-            print("FFMPEG_PATH not set in .env. Assuming ffmpeg is in system PATH.")
+        self.FFMPEG_OPTIONS = ffmpeg_options()
 
         self.yt_dlp = YouTubeDL(self.YTDL_OPTIONS)
         self.audio_player_task = bot.loop.create_task(self.audio_player_loop())
@@ -322,7 +377,7 @@ class MusicPlayer:
 
             if self.voice_client and self.voice_client.is_connected():
                 try:
-                    if self.FFMPEG_OPTIONS.get('executable') is None and os.getenv('FFMPEG_PATH') is not None:
+                    if self.FFMPEG_OPTIONS.get('executable') is None and ffmpeg_path_is_configured():
                         print("FFmpeg executable path is invalid. Cannot play audio.")
                         embed = discord.Embed(
                             title=f"{EMOJI_ERROR} Error",
@@ -334,7 +389,7 @@ class MusicPlayer:
                         continue
                     
                     if self.voice_client.is_playing() or self.voice_client.is_paused():
-                        self.voice_client.stop()
+                        self.stop_audio()
                         while self.voice_client.is_playing() or self.voice_client.is_paused():
                             await asyncio.sleep(0.1)
                         await asyncio.sleep(0.2)
@@ -373,8 +428,12 @@ class MusicPlayer:
                         header_block = ''.join(f'{name}: {value}\r\n'
                                                for name, value in headers.items())
                         ffmpeg_options['before_options'] += f' -headers {shlex.quote(header_block)}'
-                    source = discord.FFmpegPCMAudio(fresh_audio_url, **ffmpeg_options)
-                    self.voice_client.play(source, after=lambda e: self.bot.loop.call_soon_threadsafe(self.play_next_song, e))
+                    source = CheckedAudioSource(
+                        discord.FFmpegPCMAudio(fresh_audio_url, **ffmpeg_options), song.get('duration'))
+                    self.active_audio_source = source
+                    # Capture the item: a late callback must not reset a newer song.
+                    self.voice_client.play(source, after=lambda e, item=song: self.bot.loop.call_soon_threadsafe(
+                        self._playback_finished, item, e))
                     self.is_playing = True
                     self.playback_start_time = time.time()
                     print(f"Now playing: {self.current_song['title']}")
@@ -386,6 +445,11 @@ class MusicPlayer:
                         color=EMBED_COLOR
                     )
                     self.now_playing_message = await self.current_song['channel'].send(embed=initial_embed)
+
+                    # Sending the embed yields control; FFmpeg may have failed
+                    # (or stop() may have cleared the song) while it was sent.
+                    if self.current_song is not song or not self.is_playing:
+                        continue
                     
                     if self.current_song.get('duration') is not None and self.current_song.get('duration') > 0:
                         print(f"Starting progress update task for {self.current_song['title']} (Duration: {self.current_song['duration']}).")
@@ -413,6 +477,30 @@ class MusicPlayer:
                 print("Voice client not connected, skipping song.")
                 self.play_next_song(None)
 
+    def stop_audio(self):
+        if self.active_audio_source:
+            self.active_audio_source.cancelled = True
+        if self.voice_client:
+            self.voice_client.stop()
+
+    def _playback_finished(self, song, error):
+        if self.current_song is not song:
+            self.queue.task_done()
+            return
+        self.play_next_song(error)
+        if error:
+            self.bot.loop.create_task(self._report_playback_error(song, error))
+
+    async def _report_playback_error(self, song, error):
+        try:
+            await song['channel'].send(embed=discord.Embed(
+                title=f'{EMOJI_ERROR} Playback Error',
+                description=f"Playback failed for **{song.get('title', 'a song')}**. "
+                            'The audio stream could not be played. Skipping to the next song.',
+                color=EMBED_COLOR))
+        except discord.HTTPException as report_error:
+            print(f'Could not send playback error message: {report_error}')
+
     def play_next_song(self, error):
         """
         Callback function called after a song finishes or an error occurs.
@@ -420,7 +508,8 @@ class MusicPlayer:
         if error:
             print(f"Player error in play_next_song: {error}")
         self.is_playing = False
-        print(f"Song finished or errored, is_playing set to False.")
+        self.active_audio_source = None
+        print('Playback failed.' if error else 'Playback ended or was stopped.')
         self.bot.loop.call_soon_threadsafe(self.queue.task_done)
         if self.progress_update_task and not self.progress_update_task.done():
             self.progress_update_task.cancel()
@@ -433,6 +522,21 @@ class MusicPlayer:
         """
         Adds a song or playlist to the queue.
         """
+        progress_message = None
+        progress_task = None
+
+        async def report(embed):
+            if progress_task:
+                progress_task.cancel()
+                await asyncio.gather(progress_task, return_exceptions=True)
+            if progress_message is not None:
+                try:
+                    await progress_message.edit(embed=embed)
+                    return
+                except discord.HTTPException:
+                    pass
+            await ctx.send(embed=embed)
+
         try:
             query = normalize_youtube_input(url)
         except ValueError as error:
@@ -440,13 +544,29 @@ class MusicPlayer:
                                               description=str(error), color=EMBED_COLOR))
             return
         try:
+            is_playlist = not query.startswith('ytsearch1:') and (
+                'list' in parse_qs(urlsplit(query).query) or urlsplit(query).path == '/playlist')
+            progress = None
+            if is_playlist:
+                progress_message = await ctx.send(embed=discord.Embed(
+                    title=f'{EMOJI_FETCHING} Adding Songs',
+                    description='Adding songs from playlist: fetching title... (0/?)\nLimit: first 500 entries.',
+                    color=EMBED_COLOR))
+                progress = PlaylistProgress(progress_message)
+                progress_task = self.bot.loop.create_task(progress.run())
             ytdl_options_for_playlist_info = self.YTDL_OPTIONS.copy()
             ytdl_options_for_playlist_info['noplaylist'] = False
-            ytdl_options_for_playlist_info['extract_flat'] = True
+            # Follow top-level redirects (watch?list= -> playlist), but keep
+            # individual playlist entries flat to avoid per-video extraction.
+            ytdl_options_for_playlist_info['extract_flat'] = 'in_playlist'
+            # Bound pagination inside yt-dlp, not just the resulting queue.
+            ytdl_options_for_playlist_info['playlistend'] = PLAYLIST_LIMIT
+            ytdl_options_for_playlist_info['lazy_playlist'] = True
             if 'postprocessors' in ytdl_options_for_playlist_info:
                 del ytdl_options_for_playlist_info['postprocessors']
 
             yt_dlp_instance_for_playlist = YouTubeDL(ytdl_options_for_playlist_info)
+            yt_dlp_instance_for_playlist.playlist_progress = progress
 
             try:
                 data = await asyncio.wait_for(
@@ -459,46 +579,48 @@ class MusicPlayer:
                     description=f"Failed to extract information from `{url}` within 180 seconds. The link might be too large or problematic.",
                     color=EMBED_COLOR
                 )
-                await ctx.send(embed=embed)
+                await report(embed)
                 print(f"DEBUG: Extraction Timeout for URL: {url}")
                 return
 
             print(f"DEBUG: Raw data extracted by yt-dlp: {data.keys() if isinstance(data, dict) else data}")
 
             songs_to_add = []
-            if 'entries' in data:
+            if data and 'entries' in data:
                 playlist_title = data.get('title', 'Unknown Playlist')
-                print(f"DEBUG: Processing playlist '{playlist_title}' with {len(data.get('entries', []))} entries.")
-                for i, entry in enumerate(data['entries']):
-                    if entry and entry.get('url'):
+                processed = unavailable = 0
+                for i, entry in enumerate(islice(data['entries'], PLAYLIST_LIMIT)):
+                    processed += 1
+                    try:
+                        if (not entry or not entry.get('url')
+                                or entry.get('title') in ('[Deleted video]', '[Private video]')
+                                or entry.get('availability') in ('private', 'needs_auth', 'premium_only', 'subscriber_only')):
+                            raise ValueError('Unavailable entry')
+                        entry_url = youtube_url(entry['url'])
+                    except ValueError:
+                        unavailable += 1
+                        continue
+                    else:
                         song_info = {
                             'title': entry.get('title', f"Song {i+1} (Fetching...)"),
-                            'webpage_url': youtube_url(entry['url']),
+                            'webpage_url': entry_url,
                             'duration': None,
                             'channel': ctx.channel,
                             'requester': ctx.author
                         }
                         songs_to_add.append(song_info)
                         print(f"DEBUG: Added playlist entry {i+1}: {song_info['webpage_url']}")
-                    else:
-                        print(f"DEBUG: Skipping invalid playlist entry at index {i} (entry is None or missing URL).")
-                
-                if not songs_to_add:
-                    embed = discord.Embed(
-                        title=f"{EMOJI_ERROR} Playlist Empty or Invalid",
-                        description=f"No valid songs could be extracted from the playlist: **[{playlist_title}]({url})**.",
-                        color=EMBED_COLOR
-                    )
-                    await ctx.send(embed=embed)
-                    return
-
-                embed = discord.Embed(
-                    title=f"{EMOJI_PLAYLIST} Playlist Added!",
-                    description=f"Added **{len(songs_to_add)}** songs from playlist **[{playlist_title}]({url})** to the queue.",
-                    color=EMBED_COLOR
-                )
-                await ctx.send(embed=embed)
-            elif data:
+                total = data.get('playlist_count')
+                cap_note = ''
+                if isinstance(total, int) and total > PLAYLIST_LIMIT:
+                    cap_note = f'\nCapped at the first {PLAYLIST_LIMIT} of {total} entries.'
+                elif processed == PLAYLIST_LIMIT:
+                    cap_note = f'\nLimited to the first {PLAYLIST_LIMIT} entries; later entries were not inspected.'
+                completion_embed = discord.Embed(
+                    title=f"{EMOJI_PLAYLIST} Playlist Added!" if songs_to_add else f"{EMOJI_ERROR} Playlist Empty or Invalid",
+                    description=f'Added **{len(songs_to_add)}/{processed}** songs from playlist **{playlist_title[:200]}** ({unavailable} unavailable).{cap_note}',
+                    color=EMBED_COLOR)
+            elif data and not is_playlist and data.get('_type', 'video') == 'video':
                 song_info = {
                     'title': data.get('title', 'Unknown Title'),
                     'webpage_url': youtube_url(data.get('webpage_url') or ''),
@@ -522,14 +644,14 @@ class MusicPlayer:
                         description=f"**[{songs_to_add[0]['title']}]({songs_to_add[0]['webpage_url']})** will start playing shortly.",
                         color=EMBED_COLOR
                     )
-                await ctx.send(embed=embed)
+                await report(embed)
             else:
                 embed = discord.Embed(
                     title=f"{EMOJI_ERROR} Extraction Error",
                     description=f"Could not extract any information from the provided URL: `{url}`. It might be invalid or unsupported.",
                     color=EMBED_COLOR
                 )
-                await ctx.send(embed=embed)
+                await report(embed)
                 print(f"DEBUG: No data extracted from URL: {url}")
                 return
 
@@ -540,6 +662,8 @@ class MusicPlayer:
                     print(f"DEBUG: Successfully put '{song_info['title']}' into internal queues.")
                 else:
                     print(f"DEBUG: Skipping invalid song entry: {song_info.get('title', 'Unknown Title')} (Missing webpage_url).")
+            if data and 'entries' in data:
+                await report(completion_embed)
 
         except youtube_dl.DownloadError as e:
             embed = discord.Embed(
@@ -547,7 +671,7 @@ class MusicPlayer:
                 description=f"Could not download/extract info for `{url}`: `{e}`. This might be a private video or unsupported link.",
                 color=EMBED_COLOR
             )
-            await ctx.send(embed=embed)
+            await report(embed)
             print(f"DEBUG: DownloadError in add_to_queue: {e}")
         except Exception as e:
             embed = discord.Embed(
@@ -555,8 +679,12 @@ class MusicPlayer:
                 description=f"An error occurred while processing your request: `{e}`",
                 color=EMBED_COLOR
             )
-            await ctx.send(embed=embed)
+            await report(embed)
             print(f"DEBUG: General Error in add_to_queue: {e}")
+        finally:
+            if progress_task:
+                progress_task.cancel()
+                await asyncio.gather(progress_task, return_exceptions=True)
 
     async def connect_to_voice(self, channel):
         """
@@ -576,6 +704,7 @@ class MusicPlayer:
         Disconnects the bot from the voice channel.
         """
         if self.voice_client:
+            self.stop_audio()
             await self.voice_client.disconnect()
             self.voice_client = None
             self.is_playing = False

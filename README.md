@@ -41,10 +41,33 @@ with Connect, Speak, Send Messages, Embed Links, and Read Message History permis
 Run:
 
 ```powershell
-uv run main.py
+uv run python -m zixona
 ```
 
 Stop an existing bot process before syncing dependencies or starting another copy.
+
+## Project layout
+
+```text
+zixona/
+  __init__.py
+  __main__.py       # Small startup entry point
+  bot.py            # Bot creation, events, extension loading
+  config.py         # Project-root .env loading and FFmpeg settings
+  player.py         # Playback lifecycle, extraction, and queues
+  presentation.py   # Display constants and duration formatting
+  cogs/
+    __init__.py
+    music.py        # Commands and queue view
+tests/              # Local tests, intentionally ignored by Git
+```
+
+`pyproject.toml`, `uv.lock`, `.env.example`, `Dockerfile`, and
+`docker-compose.yml` stay at the repository root. Run commands from that root.
+The bot loads the `zixona.cogs.music` extension. Importing modules does not load
+`.env` or connect to Discord; environment loading happens at startup.
+
+Run the local test suite with `uv run python -m unittest discover -s tests -v`.
 
 ## Docker
 

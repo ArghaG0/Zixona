@@ -1,15 +1,7 @@
 import discord
 from discord.ext import commands
-import os
-import dotenv
-
-# Load environment variables from a .env file
-dotenv.load_dotenv()
-
-# Get your bot token from Discord Developer Portal.
-# It's highly recommended to use environment variables for sensitive information.
-DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
-# FFMPEG_PATH will be accessed directly by the music_player.py file using os.getenv()
+from zixona.config import load_settings
+from zixona.presentation import EMBED_COLOR, EMOJI_ERROR
 
 # Define intents for your bot.
 # MESSAGE_CONTENT is required to read messages for commands.
@@ -30,8 +22,8 @@ async def on_ready():
     print(f'Logged in as {bot.user.name} ({bot.user.id})')
     print('------')
     try:
-        # Load the music_cog.py extension
-        await bot.load_extension('music_cog')
+        # Load the packaged music extension
+        await bot.load_extension('zixona.cogs.music')
         print("MusicCog loaded successfully.")
     except commands.ExtensionAlreadyLoaded:
         print("MusicCog was already loaded (this might happen during hot-reloads).")
@@ -46,9 +38,6 @@ async def on_command_error(ctx, error):
     Global error handler for bot commands.
     This handles errors that occur across all commands, regardless of cog.
     """
-    EMBED_COLOR = discord.Color(0xFFB6C1) # Define EMBED_COLOR here for global error handling
-    EMOJI_ERROR = "❌"
-
     if isinstance(error, commands.CommandNotFound):
         embed = discord.Embed(
             title=f"{EMOJI_ERROR} Command Not Found",
@@ -104,10 +93,11 @@ async def on_command_error(ctx, error):
         print(f"Unhandled error: {error}")
 
 # --- Run the Bot ---
-if __name__ == '__main__':
+def main():
+    DISCORD_BOT_TOKEN = load_settings()
     if not DISCORD_BOT_TOKEN:
         print("Error: DISCORD_BOT_TOKEN environment variable not set.")
-        print("Please create a .env file in the same directory as your bot script with the following content:")
+        print("Please create a .env file in the project root with the following content:")
         print("DISCORD_BOT_TOKEN=\"YOUR_BOT_TOKEN_HERE\"")
         print("FFMPEG_PATH=\"C:/path/to/ffmpeg/bin/ffmpeg.exe\" (or your actual ffmpeg executable path)")
         print("Replace YOUR_BOT_TOKEN_HERE with your actual bot token.")

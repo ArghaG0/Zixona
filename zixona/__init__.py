@@ -1,0 +1,1 @@
+"""Zixona Discord music bot."""

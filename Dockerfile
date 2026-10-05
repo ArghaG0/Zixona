@@ -20,6 +20,6 @@ ENV PATH="/app/.venv/bin:$PATH" \
     FFMPEG_PATH=/usr/bin/ffmpeg
 WORKDIR /app
 COPY --from=dependencies /app/.venv /app/.venv
-COPY main.py music_cog.py music_player.py ./
+COPY zixona/ ./zixona/
 USER bot
-CMD ["python", "main.py"]
+CMD ["python", "-m", "zixona"]
